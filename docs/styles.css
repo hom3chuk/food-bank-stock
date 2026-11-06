@@ -81,6 +81,9 @@ textarea { min-height: 76px; resize: vertical; }
 .scanner video { display: block; width: 100% !important; }
 .scanner-idle { min-height: 0; background: none; }
 .scan-surface { width: 1000px; transform-origin: 0 0; }
+.scan-flash { position: absolute; inset: 0; z-index: 5; display: flex; align-items: flex-end; justify-content: center; padding: 12px; pointer-events: none; animation: scan-flash .7s ease-out forwards; }
+.scan-flash span { max-width: 100%; padding: 4px 10px; border-radius: 8px; background: var(--brand); color: var(--brand-ink); font-size: .875rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@keyframes scan-flash { from { background: rgba(144, 238, 144, .75); } to { background: rgba(144, 238, 144, 0); } }
 .hidden-region { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
 
 .stepper { display: grid; grid-template-columns: 60px 1fr 60px; gap: 10px; align-items: stretch; }

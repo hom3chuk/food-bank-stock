@@ -698,3 +698,114 @@ test('a barcode can be read from further away, small in the frame', { timeout: 1
     server.close();
   }
 });
+
+test('a scan flashes, beeps and puts the item at the top of the list', { timeout: 120000 }, async () => {
+  fs.mkdirSync(OUT, { recursive: true });
+  const helper = await chromium.launch(launchOptions);
+  const { jpeg } = await barcodeImages(helper);
+  await helper.close();
+  const videoPath = path.join(OUT, 'flash-barcode.mjpeg');
+  fs.writeFileSync(videoPath, Buffer.concat(Array(30).fill(jpeg)));
+
+  const { server, url } = await startServer({ port: 0 });
+  const browser = await chromium.launch({
+    ...launchOptions,
+    args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${videoPath}`],
+  });
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, permissions: ['camera'] });
+  await context.addInitScript(() => {
+    delete window.BarcodeDetector;
+    window.beeps = 0;
+    const start = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (...args) { window.beeps += 1; return start.apply(this, args); };
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  page.on('dialog', (d) => d.accept());
+  const beeps = () => page.evaluate(() => window.beeps);
+  const flash = page.locator('.scan-flash');
+  const tab = (name) => page.locator('nav button', { hasText: name }).click();
+  const typeCode = async (value) => {
+    await page.getByLabel('Barcode number').fill(value);
+    await page.getByRole('button', { name: 'Go', exact: true }).click();
+  };
+  const receiveTyped = async (code, name) => {
+    await typeCode(code);
+    await page.getByLabel('Product name').fill(name);
+    await page.getByRole('button', { name: 'Add product and save' }).click();
+    await page.getByText(`Added 1 × ${name}.`).waitFor();
+  };
+  const firstRow = (scope) => page.locator(`${scope} .row`).first();
+
+  try {
+    await page.goto(url);
+    await page.getByLabel('Your name').fill('Sam');
+    await page.getByLabel('Passcode').fill('test-passcode');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+
+    // A barcode nobody has received gets the warning, with no flash or beep.
+    await tab('Pack');
+    await page.getByRole('button', { name: 'Scan barcode' }).click();
+    await page.getByText(`Barcode ${BARCODE} has not been received yet.`).waitFor({ timeout: 30000 });
+    assert.equal(await beeps(), 0);
+    assert.equal(await flash.isVisible(), false);
+    await page.getByRole('button', { name: 'Stop camera' }).click();
+
+    // On Receive, nothing is saved at the scan, so it says "scanned" and only then opens the form.
+    await tab('Receive');
+    await page.getByRole('button', { name: 'Scan barcode' }).click();
+    await page.getByText(`${BARCODE} scanned`).waitFor({ timeout: 30000 });
+    assert.equal(await beeps(), 1);
+    await page.getByRole('heading', { name: 'New product' }).waitFor();
+    await page.getByLabel('Product name').fill('Beans');
+    await page.getByRole('button', { name: 'Add product and save' }).click();
+    await page.getByText('Added 1 × Beans.').waitFor();
+    assert.equal(await beeps(), 2);
+    await page.getByRole('button', { name: 'Stop camera' }).click({ timeout: 15000 });
+    await receiveTyped('96385074', 'Rice');
+    await receiveTyped('036000291452', 'Oil');
+
+    // Pack: typed items stack newest first, and a camera scan flashes and goes on top.
+    await tab('Pack');
+    await typeCode('96385074');
+    await page.getByText('1 item in each packet').waitFor();
+    await typeCode('036000291452');
+    await page.getByText('2 items in each packet').waitFor();
+    assert.match(await firstRow('.card').innerText(), /Oil/);
+    const before = await beeps();
+    await page.getByRole('button', { name: 'Scan barcode' }).click();
+    await page.getByText('Beans added').waitFor({ timeout: 30000 });
+    await page.screenshot({ path: path.join(OUT, '5-scan-flash.png') });
+    assert.equal(await beeps(), before + 1);
+    assert.match(await firstRow('.card').innerText(), /Beans/);
+    await flash.waitFor({ state: 'hidden', timeout: 5000 });
+    await page.getByRole('button', { name: 'Stop camera' }).click();
+
+    // Scanning an item already on the list moves it back to the top.
+    await typeCode('96385074');
+    await page.getByText('4 items in each packet').waitFor();
+    assert.match(await firstRow('.card').innerText(), /Rice/);
+    await page.getByLabel('How many identical packets?').fill('1');
+    await page.getByRole('button', { name: /^Create/ }).click();
+    await page.getByRole('heading', { name: 'Packet created' }).waitFor();
+
+    // Give out: a new item appears above the packet already in the basket.
+    await tab('Give out');
+    await page.getByLabel('Packet number').fill('1');
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await page.locator('#basket').getByText('Packet 1').waitFor();
+    await typeCode('036000291452');
+    await page.getByText(/^Basket: .*item/).waitFor();
+    assert.match(await firstRow('#basket').innerText(), /Oil/);
+
+    assert.deepEqual(errors, []);
+  } catch (err) {
+    await page.screenshot({ path: path.join(OUT, 'flash-failure.png'), fullPage: true }).catch(() => {});
+    throw err;
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});

@@ -67,6 +67,66 @@ function buzz() {
   if (navigator.vibrate) navigator.vibrate(60);
 }
 
+// Phones only allow sound once the person has touched the page, and may suspend it later.
+let audio = null;
+
+function wakeAudio() {
+  try {
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return;
+    if (!audio) audio = new Context();
+    if (audio.state === 'suspended') audio.resume().catch(() => {});
+  } catch { /* The app works without sound. */ }
+}
+
+['pointerdown', 'touchend', 'click', 'keydown'].forEach((type) => document.addEventListener(type, wakeAudio, true));
+
+function beep() {
+  wakeAudio();
+  if (!audio) return;
+  try {
+    const tone = audio.createOscillator();
+    const volume = audio.createGain();
+    const now = audio.currentTime;
+    tone.frequency.value = 880;
+    volume.gain.setValueAtTime(0.0001, now);
+    volume.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+    volume.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+    tone.connect(volume).connect(audio.destination);
+    tone.start(now);
+    tone.stop(now + 0.16);
+  } catch { /* The app works without sound. */ }
+}
+
+let flashTimer = null;
+
+/** Flashes the camera view green with a short message. Does nothing while the camera is off. */
+function flashScan(text) {
+  const flash = document.querySelector('.scanner:not(.scanner-idle) .scan-flash');
+  if (!flash) return;
+  clearTimeout(flashTimer);
+  flash.firstChild.textContent = text;
+  flash.hidden = true;
+  // Showing it again restarts the animation, so scanning quickly flashes every time.
+  void flash.offsetWidth;
+  flash.hidden = false;
+  flashTimer = setTimeout(() => { flash.hidden = true; }, 1500);
+}
+
+function confirmAdded(name) {
+  beep();
+  buzz();
+  flashScan(t('scan.added', { name }));
+}
+
+/** Counts one more of an item. Lists show the end of the array first, so it appears at the top. */
+function addScanned(items, barcode, details) {
+  const at = items.findIndex((i) => i.barcode === barcode);
+  const item = at >= 0 ? items.splice(at, 1)[0] : { barcode, ...details, qty: 0 };
+  item.qty += 1;
+  items.push(item);
+}
+
 /* ---------- Language ---------- */
 
 const { languages: LANGUAGES, strings: STRINGS } = window.I18N;
@@ -381,7 +441,8 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
   // which loses the bars of a barcode that isn't filling the view. So it gets a large surface,
   // scaled down to fit the screen. (A CSS transform doesn't change the size the library sees.)
   const region = h('div.scan-surface', { id: regionId });
-  const viewfinder = h('div.scanner.scanner-idle', null, region);
+  const viewfinder = h('div.scanner.scanner-idle', null, region,
+    h('div.scan-flash', { hidden: true, role: 'status' }, h('span')));
   const hint = h('p.muted', { hidden: true }, t('scan.hint'));
   let lastCode = '';
   let lastAt = 0;
@@ -409,14 +470,20 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
       lastCode = code;
       lastAt = now;
       if (repeat) return;
-      buzz();
       onCode(code);
       return;
     }
     if (lastCode) return;
     lastCode = code;
+    // Nothing is saved yet, because the form comes next. Pause so the flash can be seen.
+    const known = product(code);
+    beep();
     buzz();
-    scanner.stop().then(() => onCode(code, true));
+    flashScan(t('scan.scanned', { name: known ? known.name : code }));
+    setTimeout(() => {
+      if (!viewfinder.isConnected) return;
+      scanner.stop().then(() => onCode(code, true));
+    }, 500);
   }
 
   function turnOn() {
@@ -453,7 +520,7 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
       hint.hidden = true;
       try {
         const code = await scanner.scanPhoto(file, regionId);
-        buzz();
+        if (!continuous) { beep(); buzz(); }
         onCode(code);
       } catch {
         showNotice('warn', say('scan.noCodeInPhoto'));
@@ -620,6 +687,7 @@ async function saveReceive(v, payload) {
   const reply = await request('receive', { ...payload, opId: v.opId });
   if (!reply) return;
   const { name, qty } = reply.result;
+  beep();
   app.notice = { kind: 'good', text: say('receive.added', { qty, name }), undoOp: reply.opId };
   // Only a live scan turns the camera back on. If the number was typed, the camera may be broken,
   // and its warning would replace this confirmation and its Undo button.
@@ -676,7 +744,7 @@ function packScreen() {
   }
 
   function drawItems() {
-    listEl.replaceChildren(...draft.items.map((item) => {
+    listEl.replaceChildren(...[...draft.items].reverse().map((item) => {
       const p = product(item.barcode);
       return h('div.row', null,
         h('div.row-main', null,
@@ -703,14 +771,13 @@ function packScreen() {
         showNotice('warn', say('common.notReceived', { code }));
         return;
       }
-      const existing = draft.items.find((i) => i.barcode === code);
-      if (existing) existing.qty += 1;
-      else draft.items.push({ barcode: code, qty: 1 });
+      addScanned(draft.items, code);
       draft.opId = newOpId();
       app.notice = null;
       const slot = document.getElementById('notice-slot');
       if (slot) slot.replaceChildren();
       drawItems();
+      confirmAdded(product(code).name);
     });
   }
 
@@ -837,7 +904,7 @@ function giveScreen() {
   }, t('give.emptyBasket'));
   const barText = h('span');
   const basketCard = h('div.card', { id: 'basket' },
-    h('h2', null, t('give.basket')), emptyNote, packetRows, itemRows, finish, clear);
+    h('h2', null, t('give.basket')), emptyNote, itemRows, packetRows, finish, clear);
   const bar = h('div.basket-bar', null, barText,
     h('button', { type: 'button', onclick: () => basketCard.scrollIntoView({ block: 'start', behavior: 'smooth' }) }, t('give.review')));
 
@@ -888,7 +955,7 @@ function giveScreen() {
         }));
     }));
 
-    itemRows.replaceChildren(...draft.items.map((item) => {
+    itemRows.replaceChildren(...[...draft.items].reverse().map((item) => {
       const p = product(item.barcode);
       const short = p && item.qty > p.available;
       return h('div.row', null,
@@ -942,11 +1009,10 @@ function giveScreen() {
         showNotice('warn', say('common.notReceived', { code }));
         return;
       }
-      const existing = draft.items.find((i) => i.barcode === code);
-      if (existing) existing.qty += 1;
-      else draft.items.push({ barcode: code, qty: 1 });
+      addScanned(draft.items, code);
       saveDraft(draft, true);
       draw();
+      confirmAdded(product(code).name);
     });
   }
 
@@ -1095,7 +1161,7 @@ function editScreen() {
   const saveButton = h('button.btn.primary', { type: 'button', onclick: () => save(false) }, t('edit.save'));
 
   function draw() {
-    listEl.replaceChildren(...edit.items.map((item) => {
+    listEl.replaceChildren(...[...edit.items].reverse().map((item) => {
       const p = product(item.barcode);
       const short = p && item.qty - originalQty(item.barcode) > p.available;
       return h('div.row', null,
@@ -1124,11 +1190,10 @@ function editScreen() {
     resolveProduct(code, () => {
       const p = product(code);
       if (!p) { showNotice('warn', say('common.notReceived', { code })); return; }
-      const existing = edit.items.find((i) => i.barcode === code);
-      if (existing) existing.qty += 1;
-      else edit.items.push({ barcode: code, name: p.name, qty: 1 });
+      addScanned(edit.items, code, { name: p.name });
       edit.opId = newOpId();
       draw();
+      confirmAdded(p.name);
     });
   }
 
@@ -1166,9 +1231,9 @@ function editScreen() {
   return h('div.card', null,
     h('h2', null, t('edit.title', { n: number })),
     h('p.muted', null, t('edit.intro')),
+    codeEntry({ continuous: true, onCode: addCode }),
     listEl,
     emptyHint,
-    codeEntry({ continuous: true, onCode: addCode }),
     h('button.btn', { type: 'button', onclick: () => openPackPicker(addCode) }, t('common.addNoBarcode')),
     saveButton,
     h('button.btn', { type: 'button', onclick: close }, t('common.cancel')));
