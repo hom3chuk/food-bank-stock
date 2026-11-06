@@ -1,0 +1,14 @@
+{
+  "name": "food-bank-tracker",
+  "private": true,
+  "description": "Barcode stock tracking for a food bank, saved to a Google Sheet.",
+  "scripts": {
+    "test": "node --test test/backend.test.js test/i18n.test.js",
+    "test:e2e": "node --test test/e2e.test.js",
+    "dev": "node test/dev-server.js"
+  },
+  "devDependencies": {
+    "html5-qrcode": "^2.3.8",
+    "playwright": "^1.65.0"
+  }
+}
