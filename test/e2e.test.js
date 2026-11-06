@@ -651,3 +651,50 @@ test('with no working camera, every scanning screen works by typing the number',
     server.close();
   }
 });
+
+test('a barcode can be read from further away, small in the frame', { timeout: 120000 }, async () => {
+  fs.mkdirSync(OUT, { recursive: true });
+  // A portrait frame, like a phone's, with the barcode at about a quarter of its width.
+  const helper = await chromium.launch(launchOptions);
+  const framePage = await helper.newPage({ viewport: { width: 1440, height: 1920 } });
+  await framePage.setContent('<body style="margin:0;background:#fff"><canvas id="c" width="1440" height="1920" style="filter:blur(1px)"></canvas></body>');
+  await framePage.evaluate((bits) => {
+    const ctx = document.getElementById('c').getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, 1440, 1920);
+    ctx.fillStyle = '#000';
+    const unit = 4;
+    const left = Math.floor((1440 - bits.length * unit) / 2);
+    [...bits].forEach((b, i) => { if (b === '1') ctx.fillRect(left + i * unit, 840, unit, 240); });
+  }, ean13Bits(BARCODE));
+  const videoPath = path.join(OUT, 'small-barcode.mjpeg');
+  fs.writeFileSync(videoPath, Buffer.concat(Array(10).fill(await framePage.screenshot({ type: 'jpeg', quality: 90 }))));
+  await helper.close();
+
+  const { server, url } = await startServer({ port: 0 });
+  const browser = await chromium.launch({
+    ...launchOptions,
+    args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${videoPath}`],
+  });
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, permissions: ['camera'] });
+  await context.addInitScript(() => { delete window.BarcodeDetector; });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+
+  try {
+    await page.goto(url);
+    await page.getByLabel('Your name').fill('Sam');
+    await page.getByLabel('Passcode').fill('test-passcode');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+    await page.getByRole('button', { name: 'Scan barcode' }).click();
+    await page.getByText(`Barcode ${BARCODE} is not in the sheet yet.`).waitFor({ timeout: 15000 });
+    const over = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(over <= 0, `page scrolls sideways by ${over}px`);
+    assert.deepEqual(errors, []);
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});

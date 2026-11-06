@@ -80,6 +80,7 @@ textarea { min-height: 76px; resize: vertical; }
 .scanner { background: #101513; border-radius: 12px; overflow: hidden; min-height: 240px; position: relative; }
 .scanner video { display: block; width: 100% !important; }
 .scanner-idle { min-height: 0; background: none; }
+.scan-surface { width: 1000px; transform-origin: 0 0; }
 .hidden-region { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
 
 .stepper { display: grid; grid-template-columns: 60px 1fr 60px; gap: 10px; align-items: stretch; }

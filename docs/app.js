@@ -289,6 +289,18 @@ const scanner = (() => {
     });
   }
 
+  // Phone cameras can't focus up close. Zoom lets the barcode look big from further away.
+  // Not every phone offers these, and the scanner still works without them.
+  function helpFocus(reader) {
+    try {
+      const can = reader.getRunningTrackCapabilities();
+      const advanced = [];
+      if (can.focusMode && can.focusMode.includes('continuous')) advanced.push({ focusMode: 'continuous' });
+      if (can.zoom) advanced.push({ zoom: Math.min(2, can.zoom.max) });
+      if (advanced.length) reader.applyVideoConstraints({ advanced }).catch(() => {});
+    } catch { /* This browser can't report what its camera supports. */ }
+  }
+
   function stop() {
     return enqueue(async () => {
       if (!instance) return;
@@ -312,7 +324,11 @@ const scanner = (() => {
       try {
         started = reader.start(
           { facingMode: 'environment' },
-          { fps: 10, qrbox: (w, height) => ({ width: Math.max(50, Math.floor(w * 0.9)), height: Math.max(50, Math.floor(height * 0.55)) }) },
+          {
+            fps: 10,
+            videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1440 } },
+            qrbox: (w, height) => ({ width: Math.max(50, Math.floor(w * 0.8)), height: Math.max(50, Math.floor(Math.min(height * 0.45, w * 0.5))) }),
+          },
           (text) => {
             // Two matching reads in a row filters out most misreads of worn labels.
             if (text !== lastRead) { lastRead = text; return; }
@@ -332,6 +348,7 @@ const scanner = (() => {
           clearInterval(poll);
         }
         running = true;
+        helpFocus(reader);
       } catch {
         instance = null;
         running = false;
@@ -360,9 +377,26 @@ const scanner = (() => {
  */
 function codeEntry({ onCode, continuous, autoStart, ignore }) {
   const regionId = 'scan-region';
-  const region = h('div.scanner.scanner-idle', { id: regionId });
+  // The scanner library shrinks each frame to the on-screen size of its box before reading it,
+  // which loses the bars of a barcode that isn't filling the view. So it gets a large surface,
+  // scaled down to fit the screen. (A CSS transform doesn't change the size the library sees.)
+  const region = h('div.scan-surface', { id: regionId });
+  const viewfinder = h('div.scanner.scanner-idle', null, region);
+  const hint = h('p.muted', { hidden: true }, t('scan.hint'));
   let lastCode = '';
   let lastAt = 0;
+
+  function fitViewfinder() {
+    const scale = viewfinder.clientWidth / region.offsetWidth;
+    const full = region.offsetHeight * scale;
+    // A tall camera picture is cropped evenly, keeping the box in view and the buttons on screen.
+    const visible = Math.min(full, window.innerHeight * 0.55);
+    viewfinder.style.height = full ? `${visible}px` : '';
+    region.style.transform = `translateY(${(visible - full) / 2}px) scale(${scale})`;
+  }
+  const fitter = new ResizeObserver(fitViewfinder);
+  fitter.observe(viewfinder);
+  fitter.observe(region);
 
   const toggle = h('button.btn.primary', { type: 'button', onclick: () => (scanner.isOn() ? turnOff() : turnOn()) }, t('scan.start'));
 
@@ -386,23 +420,25 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
   }
 
   function turnOn() {
-    region.classList.remove('scanner-idle');
+    viewfinder.classList.remove('scanner-idle');
     toggle.textContent = t('scan.starting');
     toggle.disabled = true;
     lastCode = '';
     scanner.start(regionId, deliver, () => {
-      region.classList.add('scanner-idle');
+      viewfinder.classList.add('scanner-idle');
       showNotice('warn', say('scan.cameraFailed'));
     }).then(() => {
       toggle.disabled = false;
       toggle.textContent = scanner.isOn() ? t('scan.stop') : t('scan.start');
+      hint.hidden = !scanner.isOn();
     });
   }
 
   function turnOff() {
     scanner.stop().then(() => {
-      region.classList.add('scanner-idle');
+      viewfinder.classList.add('scanner-idle');
       toggle.textContent = t('scan.start');
+      hint.hidden = true;
     });
   }
 
@@ -412,8 +448,9 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
       const file = event.target.files[0];
       event.target.value = '';
       if (!file) return;
-      region.classList.add('scanner-idle');
+      viewfinder.classList.add('scanner-idle');
       toggle.textContent = t('scan.start');
+      hint.hidden = true;
       try {
         const code = await scanner.scanPhoto(file, regionId);
         buzz();
@@ -444,7 +481,8 @@ function codeEntry({ onCode, continuous, autoStart, ignore }) {
   if (autoStart) setTimeout(turnOn, 0);
 
   return [
-    region,
+    viewfinder,
+    hint,
     toggle,
     h('button.btn', { type: 'button', onclick: () => photoInput.click() }, t('scan.photo')),
     photoInput,
