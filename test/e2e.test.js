@@ -878,12 +878,32 @@ test('people, money and correcting a count work on a phone', { timeout: 120000 }
     await page.getByRole('button', { name: '+ Money in' }).click();
     await page.locator('.balance').getByText('10,000').waitFor();
 
+    // Other currencies are typed as free text and counted separately.
+    await page.getByLabel('Amount').fill('100 евро');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.getByText('Saved: +100 евро.').waitFor();
+    await page.locator('.balance').getByText('10,000 (100 евро)').waitFor();
+    await page.getByLabel('Amount').fill('-30 евро');
+    await page.getByRole('button', { name: '− Money out' }).click();
+    await page.getByText('Saved: -30 евро.').waitFor();
+    await page.locator('.balance').getByText('10,000 (70 евро)').waitFor();
+    await page.locator('.row', { hasText: '-30 евро' }).waitFor();
+    await page.screenshot({ path: path.join(OUT, '7b-money-currency.png'), fullPage: true });
+    await noSideScroll('money with another currency');
+    await page.getByLabel('Amount').fill('евро');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.getByText('Please enter the amount').waitFor();
+    await page.getByLabel('Amount').fill('100 евро и 50 долларов');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.getByText('Please write one amount').waitFor();
+    await page.getByLabel('Amount').fill('');
+
     // A row pasted into the sheet that can't be read gets a warning.
-    backend.tab('Деньги').getRange(10, 1, 1, 3).setValues([[100, 'вчера', '']]);
+    backend.tab('Деньги').getRange(20, 1, 1, 3).setValues([[100, 'вчера', '']]);
     await tab('Stock');
     await tab('Money');
     await page.getByText('Деньги tab of the sheet could not be read').waitFor();
-    assert.match(await page.locator('.notice.warn').innerText(), /row 10/);
+    assert.match(await page.locator('.notice.warn').innerText(), /row 20/);
 
     // Correcting a count opens a popup first, and Cancel changes nothing.
     backend.call('receive', { opId: 'e2eseed0001', barcode: BARCODE, qty: 6, product: { name: 'Canned beans' } });

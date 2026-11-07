@@ -26,7 +26,9 @@
  * Money and people have their own ledgers (TABS.MONEY, TABS.PEOPLE), with no names in them. Their
  * first columns match the old paper-style table, so past data can be pasted straight in. Pasted
  * rows have no time or operation ID, and their dates and numbers may arrive as text, so those
- * tabs are read with parseDate_ and parseAmount_. A row that can't be read is reported, not guessed.
+ * tabs are read with parseDate_, parseMoney_ and parseAmount_. A row that can't be read is reported,
+ * not guessed. A plain money amount is in RSD. Anything else, like "100 евро", is free text with its
+ * own running total, because currencies are never converted.
  */
 
 const TABS = {
@@ -111,6 +113,7 @@ const MIN_PASSCODE_LENGTH = 6;
 const MAX_AMOUNT = 100000000;
 const MAX_PEOPLE_CHANGE = 1000;
 const RECENT_MONEY_ROWS = 30;
+const RSD_NAMES = ['rsd', 'рсд', 'din', 'дин', 'динар', 'динара', 'динаров', 'dinar', 'dinara'];
 
 /* ---------- Web API ---------- */
 
@@ -366,11 +369,14 @@ function adjust_(req, db, ctx) {
 }
 
 function money_(req, db, ctx) {
-  const amount = Number(req.amount);
-  if (!Number.isInteger(amount) || amount === 0 || Math.abs(amount) > MAX_AMOUNT) throw new ApiError('BAD_REQUEST', 'badAmount');
+  const money = parseMoney_(req.amount);
+  // The RSD column shows whole numbers. Other currencies are saved as text, so cents are safe there.
+  if (!money || money.amount === 0 || Math.abs(money.amount) > MAX_AMOUNT || (!money.currency && !Number.isInteger(money.amount))) {
+    throw new ApiError('BAD_REQUEST', 'badAmount');
+  }
   const date = entryDate_(req.date, ctx);
-  addMoney_(db, ctx, { amount: amount, date: date, note: cleanText_(req.note, 200) });
-  return { action: 'MONEY', amount: amount, date: date };
+  addMoney_(db, ctx, { amount: money.amount, currency: money.currency, date: date, note: cleanText_(req.note, 200) });
+  return { action: 'MONEY', amount: money.amount, currency: money.currency, date: date };
 }
 
 function people_(req, db, ctx) {
@@ -388,8 +394,10 @@ function people_(req, db, ctx) {
 }
 
 function addMoney_(db, ctx, entry) {
-  appendRows_(TABS.MONEY, [{ amount: entry.amount, date: sheetDate_(entry.date), note: entry.note, timestamp: ctx.now.timestamp, op: ctx.op }]);
-  db.money.entries.push({ amount: entry.amount, date: entry.date, note: entry.note, op: ctx.op });
+  // The apostrophe keeps it as text. Sheets could otherwise read "20 $" as the number 20, which counts as RSD.
+  const cell = entry.currency ? "'" + cleanText_(entry.amount + ' ' + entry.currency, 80).replace(/^'/, '') : entry.amount;
+  appendRows_(TABS.MONEY, [{ amount: cell, date: sheetDate_(entry.date), note: entry.note, timestamp: ctx.now.timestamp, op: ctx.op }]);
+  db.money.entries.push({ amount: entry.amount, currency: entry.currency, date: entry.date, note: entry.note, op: ctx.op });
 }
 
 function undoMoney_(db, ctx, target, rows) {
@@ -397,7 +405,7 @@ function undoMoney_(db, ctx, target, rows) {
   if (db.money.entries.some(function (r) { return r.op === undoOp; })) return { action: 'UNDO', alreadyUndone: true };
   // Keeps the original date, so that day's total comes out right in the report.
   rows.forEach(function (r) {
-    addMoney_(db, Object.assign({}, ctx, { op: undoOp }), { amount: -r.amount, date: r.date, note: UNDO_NOTE + (r.note ? ': ' + r.note : '') });
+    addMoney_(db, Object.assign({}, ctx, { op: undoOp }), { amount: -r.amount, currency: r.currency, date: r.date, note: UNDO_NOTE + (r.note ? ': ' + r.note : '') });
   });
   return { action: 'UNDO' };
 }
@@ -645,14 +653,59 @@ function parseAmount_(value) {
   return Number(text.replace(',', '.'));
 }
 
+/**
+ * Reads a money cell as { amount, currency }, with currency '' for RSD. Accepts 6000, 100 евро and €100.
+ * Returns null if there isn't exactly one clear number, such as "100 евро и 50 долларов" or "5,000".
+ */
+function parseMoney_(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? { amount: value, currency: '' } : null;
+  const text = String(value === undefined || value === null ? '' : value).replace(/\u2212/g, '-').trim();
+  const plain = parseAmount_(text);
+  if (plain !== null) return { amount: plain, currency: '' };
+
+  const number = '(\\d[\\d\\s]*(?:[.,]\\d{1,2})?)';
+  const after = text.match(new RegExp('^([+-]?)\\s*' + number + '\\s*([^\\d]+)$'));
+  const before = after ? null : text.match(new RegExp('^([+-]?)\\s*([^\\d+-][^\\d]*?)\\s*' + number + '$'));
+  if (!after && !before) return null;
+  const digits = after ? after[2] : before[3];
+  const label = (after ? after[3] : before[2]).trim();
+  if (!/[\p{L}\p{Sc}]/u.test(label)) return null;
+
+  const amount = parseAmount_((after || before)[1] + digits);
+  if (amount === null) return null;
+  const isRsd = RSD_NAMES.indexOf(label.toLowerCase().replace(/\.$/, '')) !== -1;
+  return { amount: amount, currency: isRsd ? '' : label };
+}
+
+/** Adds to a running total per currency. "ЕВРО" and "евро" are one currency, shown as first written. */
+function addToTotals_(totals, currency, amount) {
+  const key = String(currency).toLowerCase();
+  const total = totals[key] || (totals[key] = { currency: currency, amount: 0 });
+  total.amount = roundMoney_(total.amount + amount);
+}
+
+/** The other currencies with money in them, as a list. */
+function otherCurrencies_(totals) {
+  return Object.keys(totals).filter(function (key) { return key && totals[key].amount; })
+    .sort(function (a, b) { return a.localeCompare(b, SORT_LOCALE); })
+    .map(function (key) { return totals[key]; });
+}
+
+/** How a total reads in the sheet: 10000, or 10000 (100 евро) when other currencies are involved. */
+function moneyLine_(totals) {
+  const rsd = totals[''] ? totals[''].amount : 0;
+  const others = otherCurrencies_(totals).map(function (t) { return t.amount + ' ' + t.currency; });
+  return others.length ? cleanText_(rsd + ' (' + others.join(', ') + ')', 200) : rsd;
+}
+
 function readMoney_() {
   const out = { entries: [], badRows: [] };
   readTable_(TABS.MONEY).forEach(function (r) {
     if (r.amount === '' && !r.date && !r.note) return;
-    const amount = parseAmount_(r.amount);
+    const money = parseMoney_(r.amount);
     const date = parseDate_(r.date);
-    if (amount === null || !date) out.badRows.push(r.row);
-    else out.entries.push({ row: r.row, amount: amount, date: date, note: r.note, op: r.op });
+    if (!money || !date) out.badRows.push(r.row);
+    else out.entries.push({ row: r.row, amount: money.amount, currency: money.currency, date: date, note: r.note, op: r.op });
   });
   return out;
 }
@@ -838,19 +891,19 @@ function rebuildViews_(db) {
 function rebuildLedgerViews_(db) {
   const moneyDays = {};
   db.money.entries.forEach(function (r) {
-    const day = moneyDays[r.date] || (moneyDays[r.date] = { date: r.date, moneyIn: 0, moneyOut: 0 });
-    if (r.amount > 0) day.moneyIn += r.amount;
-    else day.moneyOut -= r.amount;
+    const day = moneyDays[r.date] || (moneyDays[r.date] = { moneyIn: {}, moneyOut: {}, net: {} });
+    addToTotals_(r.amount > 0 ? day.moneyIn : day.moneyOut, r.currency, Math.abs(r.amount));
+    addToTotals_(day.net, r.currency, r.amount);
   });
   // The balance builds up from the oldest day, and the newest day is shown first.
-  let balance = 0;
+  const balance = {};
   const moneyRows = Object.keys(moneyDays).sort().map(function (date) {
     const day = moneyDays[date];
-    day.net = roundMoney_(day.moneyIn - day.moneyOut);
-    balance = roundMoney_(balance + day.net);
-    day.balance = balance;
-    day.date = sheetDate_(date);
-    return day;
+    Object.keys(day.net).forEach(function (key) { addToTotals_(balance, day.net[key].currency, day.net[key].amount); });
+    return {
+      date: sheetDate_(date), moneyIn: moneyLine_(day.moneyIn), moneyOut: moneyLine_(day.moneyOut),
+      net: moneyLine_(day.net), balance: moneyLine_(balance),
+    };
   }).reverse();
 
   const peopleTotals = peopleDays_(db.people.entries);
@@ -877,13 +930,16 @@ function moneyState_(money) {
     }
   });
   // Rows keep the order they were added, so a later row on the same date is the newer one.
-  const recent = money.entries.map(function (r, i) { return { amount: r.amount, date: r.date, note: r.note, op: r.op, order: i }; })
+  const recent = money.entries.map(function (r, i) { return { amount: r.amount, currency: r.currency, date: r.date, note: r.note, op: r.op, order: i }; })
     .filter(function (r) { return !r.op || !undone[r.op]; })
     .sort(function (a, b) { return newestFirst_(a, b) || b.order - a.order; })
     .slice(0, RECENT_MONEY_ROWS)
-    .map(function (r) { return { amount: r.amount, date: r.date, note: r.note }; });
+    .map(function (r) { return { amount: r.amount, currency: r.currency, date: r.date, note: r.note }; });
+  const totals = {};
+  money.entries.forEach(function (r) { addToTotals_(totals, r.currency, r.amount); });
   return {
-    balance: roundMoney_(money.entries.reduce(function (sum, r) { return sum + r.amount; }, 0)),
+    balance: totals[''] ? totals[''].amount : 0,
+    otherBalances: otherCurrencies_(totals),
     recent: recent,
     badRows: money.badRows,
   };

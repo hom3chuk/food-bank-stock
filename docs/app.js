@@ -1305,8 +1305,16 @@ function formatMoney(amount) {
   return new Intl.NumberFormat(htmlLang(), { maximumFractionDigits: 2 }).format(amount);
 }
 
-function signedMoney(amount) {
-  return amount > 0 ? `+${formatMoney(amount)}` : formatMoney(amount);
+/** +6,000 or -100 евро. An empty currency means RSD, which is left out. */
+function signedMoney(amount, currency) {
+  const number = amount > 0 ? `+${formatMoney(amount)}` : formatMoney(amount);
+  return currency ? `${number} ${currency}` : number;
+}
+
+/** 10,000 (100 евро): RSD first, with other currencies counted separately and never converted. */
+function balanceLine(data) {
+  const others = (data.otherBalances || []).map((b) => `${formatMoney(b.amount)} ${b.currency}`);
+  return others.length ? `${formatMoney(data.balance)} (${others.join(', ')})` : formatMoney(data.balance);
 }
 
 /* A warning for rows pasted into the sheet that can't be read, because they aren't being counted. */
@@ -1417,19 +1425,20 @@ function peopleScreen() {
 }
 
 function moneyScreen() {
-  const data = app.data.money || { balance: 0, recent: [], badRows: [] };
+  const data = app.data.money || { balance: 0, otherBalances: [], recent: [], badRows: [] };
   const today = app.data.today || new Date().toISOString().slice(0, 10);
-  const amount = h('input', { type: 'number', inputmode: 'numeric', min: '1', step: '1', autocomplete: 'off' });
+  const amount = h('input', { autocomplete: 'off', maxlength: '60', placeholder: t('money.amountPlaceholder') });
   const note = h('input', { maxlength: '200', autocomplete: 'off' });
   const date = h('input', { type: 'date', value: today, max: today });
 
   async function save(sign) {
-    const n = Number(amount.value);
-    if (!amount.value || !Number.isInteger(n) || n <= 0) {
+    // The two buttons give the sign, so a typed one is dropped.
+    const typed = amount.value.trim().replace(/^[+\-\u2212]\s*/, '');
+    if (!/\d/.test(typed)) {
       showNotice('warn', say('money.enterAmount'));
       return;
     }
-    const entry = { amount: sign * n, date: date.value || today, note: note.value };
+    const entry = { amount: (sign < 0 ? '-' : '') + typed, date: date.value || today, note: note.value };
     // Trying again after a lost connection must not save it twice. Two equal gifts in a row are
     // still two entries, because the ID is dropped once a save succeeds.
     const key = JSON.stringify(entry);
@@ -1438,7 +1447,9 @@ function moneyScreen() {
     if (!reply) return;
     app.view.moneyTry = null;
     beep();
-    app.notice = { kind: 'good', text: say('money.saved', { amount: signedMoney(entry.amount) }), undoOp: reply.opId };
+    // A retry that was already saved gets no details back, so it shows what was typed.
+    const saved = reply.result.amount === undefined ? entry.amount : signedMoney(reply.result.amount, reply.result.currency);
+    app.notice = { kind: 'good', text: say('money.saved', { amount: saved }), undoOp: reply.opId };
     render();
   }
 
@@ -1446,7 +1457,7 @@ function moneyScreen() {
     badRowsNote('Деньги', data.badRows),
     h('div.card', null,
       h('h2', null, t('money.title')),
-      h('div.balance', null, h('span.muted', null, t('money.balance')), h('strong', { class: data.balance < 0 ? 'short' : '' }, formatMoney(data.balance))),
+      h('div.balance', null, h('span.muted', null, t('money.balance')), h('strong', { class: data.balance < 0 ? 'short' : '' }, balanceLine(data))),
       h('form', { style: 'display:grid;gap:12px', onsubmit: (event) => event.preventDefault() },
         h('label', null, t('money.amount'), amount),
         h('label', null, t('money.note'), note),
@@ -1461,7 +1472,7 @@ function moneyScreen() {
           h('div.row-main', null,
             h('div.muted', null, formatDate(r.date)),
             r.note ? h('div', null, r.note) : null),
-          h(r.amount < 0 ? 'b.short' : 'b.money-in', null, signedMoney(r.amount))))
+          h(r.amount < 0 ? 'b.short' : 'b.money-in', null, signedMoney(r.amount, r.currency))))
         : h('p.muted', null, t('money.empty')))),
   ];
 }

@@ -515,8 +515,84 @@ test('the old money table pastes in and adds up', () => {
   const money = b.call('bootstrap').state.money;
   assert.equal(money.balance, 10634);
   assert.deepEqual(money.badRows, []);
-  assert.deepEqual(money.recent[0], { amount: -3500, date: '2026-11-05', note: 'лекарства андрей лк' });
+  assert.deepEqual(money.recent[0], { amount: -3500, currency: '', date: '2026-11-05', note: 'лекарства андрей лк' });
   assert.equal(money.recent.length, 8);
+});
+
+test('other currencies are counted separately from RSD', () => {
+  const b = createBackend({ date: NOV_7 });
+  b.tab('Деньги').getRange(2, 1, 4, 3).setValues([
+    [6000, '03.11.2026', ''], [2000, '03.11.2026', ''], ['100 евро', '03.11.2026', ''], [2000, '03.11.2026', ''],
+  ]);
+  b.context.onEdit({ range: { getSheet: () => b.tab('Деньги') } });
+
+  assert.deepEqual(b.tab('Деньги по дням').rows(), [
+    { 'Дата': '03.11.2026', 'Пришло': '10000 (100 евро)', 'Ушло': 0, 'Итог за день': '10000 (100 евро)', 'Остаток': '10000 (100 евро)' },
+  ]);
+  const money = b.call('bootstrap').state.money;
+  assert.equal(money.balance, 10000);
+  assert.deepEqual(money.otherBalances, [{ currency: 'евро', amount: 100 }]);
+  assert.deepEqual(money.badRows, []);
+  assert.deepEqual(money.recent[1], { amount: 100, currency: 'евро', date: '2026-11-03', note: '' });
+});
+
+test('the amount is free form, within reason', () => {
+  const b = createBackend({ date: NOV_7 });
+  const read = (value) => { const r = b.context.parseMoney_(value); return r && [r.amount, r.currency]; };
+  assert.deepEqual(read(6000), [6000, '']);
+  assert.deepEqual(read('6000'), [6000, '']);
+  assert.deepEqual(read('5 000'), [5000, '']);
+  assert.deepEqual(read('100 евро'), [100, 'евро']);
+  assert.deepEqual(read('100евро'), [100, 'евро']);
+  assert.deepEqual(read('5 000 евро'), [5000, 'евро']);
+  assert.deepEqual(read('-50,50 EUR'), [-50.5, 'EUR']);
+  assert.deepEqual(read('\u221250 $'), [-50, '$']);
+  assert.deepEqual(read('€100'), [100, '€']);
+  assert.deepEqual(read('евро 100'), [100, 'евро']);
+  assert.deepEqual(read('100 долларов США'), [100, 'долларов США']);
+  // These are RSD by name, so they join the main total.
+  assert.deepEqual(read('5000 дин.'), [5000, '']);
+  assert.deepEqual(read('5000 RSD'), [5000, '']);
+  // Not one clear amount: these get reported, not guessed.
+  for (const bad of ['евро', '', 'Сумма', '100 евро и 50 долларов', '5,000', '5,000 евро', '100 !', '100 200 евро 3']) {
+    assert.equal(read(bad), null, bad);
+  }
+});
+
+test('currencies add up and subtract by name, and a used-up one disappears', () => {
+  const b = createBackend({ date: NOV_7 });
+  b.call('money', { opId: op(), amount: '100 евро' });
+  b.call('money', { opId: op(), amount: '50 ЕВРО' });
+  b.call('money', { opId: op(), amount: '20 $' });
+  b.call('money', { opId: op(), amount: 1000 });
+  const spent = b.call('money', { opId: op(), amount: '-30 евро', note: 'закуп' });
+  assert.deepEqual(spent.result.currency, 'евро');
+  assert.equal(spent.state.money.balance, 1000);
+  assert.deepEqual(spent.state.money.otherBalances, [{ currency: '$', amount: 20 }, { currency: 'евро', amount: 120 }]);
+  assert.equal(b.tab('Деньги').rows()[4]['Сумма'], '-30 евро');
+  assert.deepEqual(b.tab('Деньги по дням').rows()[0], {
+    'Дата': '07.11.2026',
+    'Пришло': '1000 (20 $, 150 евро)',
+    'Ушло': '0 (30 евро)',
+    'Итог за день': '1000 (20 $, 120 евро)',
+    'Остаток': '1000 (20 $, 120 евро)',
+  });
+
+  // Undo takes it back in the same currency, and a total of zero is no longer listed.
+  const id = op();
+  b.call('money', { opId: id, amount: '20 $' });
+  const undone = b.call('undo', { opId: op(), targetOp: id });
+  assert.equal(b.tab('Деньги').rows().at(-1)['Сумма'], '-20 $');
+  assert.equal(undone.state.money.otherBalances[0].amount, 20);
+  const gone = b.call('money', { opId: op(), amount: '-20 $' });
+  assert.deepEqual(gone.state.money.otherBalances, [{ currency: 'евро', amount: 120 }]);
+  assert.equal(b.tab('Деньги по дням').rows()[0]['Остаток'], '1000 (120 евро)');
+
+  // Money going down never reads as a formula in the sheet.
+  b.call('money', { opId: op(), amount: -5000 });
+  assert.equal(b.tab('Деньги по дням').rows()[0]['Остаток'], '-4000 (120 евро)');
+  assert.equal(b.call('money', { opId: op(), amount: '1000.5' }).key, 'badAmount');
+  assert.equal(b.call('money', { opId: op(), amount: '10,50 евро' }).ok, true);
 });
 
 test('the old people table pastes in, with empty counts as zero and short dates', () => {
@@ -543,7 +619,7 @@ test('pasted cells can be real dates or text numbers', () => {
   sheet.getRange(2, 1, 3, 3).setValues([[100, asDate, ''], ["'+5 000", '4/11/2026', ''], ["'\u22121200,50", '2026-11-04', '']]);
   const money = b.call('bootstrap').state.money;
   assert.deepEqual(money.badRows, []);
-  assert.equal(money.balance, 3900 - 0.5 + 0);
+  assert.equal(money.balance, 3899.5);
 });
 
 test('rows that cannot be read are reported and left out of the totals', () => {

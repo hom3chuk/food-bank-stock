@@ -130,8 +130,8 @@ button.row { width: 100%; background: none; border-left: 0; border-right: 0; bor
 .day-head { border-top: 0; font-size: 14px; }
 .day-row > :not(:first-child) { text-align: right; }
 
-.balance { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-.balance strong { font-size: 32px; overflow-wrap: anywhere; }
+.balance { display: grid; gap: 2px; }
+.balance strong { font-size: 28px; line-height: 1.2; overflow-wrap: anywhere; }
 .money-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .money-in { color: var(--available); }
 .short { color: var(--danger); }
