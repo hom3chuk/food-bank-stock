@@ -809,3 +809,132 @@ test('a scan flashes, beeps and puts the item at the top of the list', { timeout
     server.close();
   }
 });
+
+test('people, money and correcting a count work on a phone', { timeout: 120000 }, async () => {
+  fs.mkdirSync(OUT, { recursive: true });
+  const { server, backend, url } = await startServer({ port: 0 });
+  const browser = await chromium.launch(launchOptions);
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'en-US' });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  const tab = (name) => page.locator('nav button', { hasText: name }).click();
+  const noSideScroll = async (where) => {
+    const over = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(over <= 0, `${where}: page scrolls sideways by ${over}px`);
+  };
+
+  try {
+    await page.goto(url);
+    await page.getByLabel('Your name').fill('Sam');
+    await page.getByLabel('Passcode').fill('test-passcode');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+
+    // People: quick taps show at once and are saved together, as one row.
+    await tab('People');
+    const more = page.getByRole('button', { name: 'Took food: One more' });
+    await more.click();
+    await more.click();
+    await more.click();
+    await page.getByRole('button', { name: 'Took food: One fewer' }).click();
+    assert.equal(await page.locator('.people-number').nth(1).innerText(), '2');
+    await page.getByRole('button', { name: 'Donated: One more' }).click();
+    assert.equal(await page.locator('.people-number').nth(0).innerText(), '1');
+    await page.locator('.day-row:not(.day-head)').first().waitFor({ timeout: 5000 });
+    await page.waitForFunction(() => document.querySelector('.day-row:not(.day-head)').innerText.replace(/\s+/g, ' ').endsWith('1 2'), null, { timeout: 5000 });
+    assert.equal(backend.tab('Люди').rows().length, 2);
+    await page.screenshot({ path: path.join(OUT, '6-people.png') });
+    await noSideScroll('people');
+
+    // The count can't go below zero, and the button says so by doing nothing.
+    await page.getByLabel('Date').fill('2020-01-01');
+    const fewer = page.getByRole('button', { name: 'Took food: One fewer' });
+    await fewer.click();
+    assert.equal(await page.locator('.people-number').nth(1).innerText(), '0');
+    assert.equal(backend.tab('Люди').rows().length, 2);
+
+    // Money in and out, then undo.
+    await tab('Money');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.getByText('Please enter the amount').waitFor();
+    await page.getByLabel('Amount').fill('5000');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.getByText('Saved: +5,000.').waitFor();
+    await page.getByLabel('Amount').fill('1666');
+    await page.getByLabel('Note').fill('закуп');
+    await page.getByRole('button', { name: '− Money out' }).click();
+    await page.getByText('Saved: -1,666.').waitFor();
+    await page.locator('.balance').getByText('3,334').waitFor();
+    await page.screenshot({ path: path.join(OUT, '7-money.png'), fullPage: true });
+    await noSideScroll('money');
+    await page.getByRole('button', { name: 'Undo' }).click();
+    await page.getByText('Undone. The entry has been reversed.').waitFor();
+    await page.locator('.balance').getByText('5,000').waitFor();
+    assert.equal(backend.tab('Деньги').rows().length, 3);
+
+    // Two equal gifts in a row are two entries.
+    await page.getByLabel('Amount').fill('5000');
+    await page.getByRole('button', { name: '+ Money in' }).click();
+    await page.locator('.balance').getByText('10,000').waitFor();
+
+    // A row pasted into the sheet that can't be read gets a warning.
+    backend.tab('Деньги').getRange(10, 1, 1, 3).setValues([[100, 'вчера', '']]);
+    await tab('Stock');
+    await tab('Money');
+    await page.getByText('Деньги tab of the sheet could not be read').waitFor();
+    assert.match(await page.locator('.notice.warn').innerText(), /row 10/);
+
+    // Correcting a count opens a popup first, and Cancel changes nothing.
+    backend.call('receive', { opId: 'e2eseed0001', barcode: BARCODE, qty: 6, product: { name: 'Canned beans' } });
+    await tab('Stock');
+    const row = page.locator('.row', { hasText: 'Canned beans' });
+    await row.getByRole('button', { name: 'Edit amount' }).click();
+    const popup = page.locator('dialog');
+    await popup.getByText('Available now: 6').waitFor();
+    await page.screenshot({ path: path.join(OUT, '8-edit-amount.png') });
+    await popup.getByRole('button', { name: 'Cancel' }).click();
+    await popup.waitFor({ state: 'detached' });
+    assert.equal(backend.tab('Журнал').rows().length, 1);
+
+    await row.getByRole('button', { name: 'Edit amount' }).click();
+    await popup.getByLabel('Quantity').fill('5');
+    await popup.getByRole('button', { name: 'Save' }).click();
+    await page.getByText('Canned beans: 5 available now.').waitFor();
+    assert.equal(backend.tab('Журнал').rows().at(-1)['Кол-во'], -1);
+    await page.getByRole('button', { name: 'Undo' }).click();
+    await page.getByText('Undone. The stock is back as it was.').waitFor();
+    await row.locator('.count.available b').getByText('6').waitFor();
+
+    // Zero is allowed, and a count someone else just changed is refused.
+    await row.getByRole('button', { name: 'Edit amount' }).click();
+    backend.call('receive', { opId: 'e2eseed0002', barcode: BARCODE, qty: 1 });
+    await popup.getByLabel('Quantity').fill('0');
+    await popup.getByRole('button', { name: 'Save' }).click();
+    await page.getByText('Someone just changed Canned beans: 7 are available now.').waitFor();
+    assert.equal(backend.tab('Журнал').rows().at(-1)['Кол-во'], 1);
+
+    // All six tab names fit, in every language, on a small phone.
+    await page.setViewportSize({ width: 320, height: 640 });
+    for (const language of ['ru', 'sr', 'en']) {
+      await page.locator('.lang-select').selectOption(language);
+      const clipped = await page.locator('nav button').evaluateAll((all) => all.filter((b) => b.scrollWidth > b.clientWidth).map((b) => b.textContent));
+      assert.deepEqual(clipped, [], `${language}: tab names cut off`);
+      await noSideScroll(`nav in ${language}`);
+    }
+    await page.locator('.lang-select').selectOption('ru');
+    await tab('Деньги');
+    await page.screenshot({ path: path.join(OUT, '9-money-ru-320.png') });
+    await tab('Люди');
+    await page.getByRole('heading', { name: 'Счётчик людей' }).waitFor();
+    await noSideScroll('people in ru');
+
+    assert.deepEqual(errors, []);
+  } catch (err) {
+    await page.screenshot({ path: path.join(OUT, 'ledger-failure.png'), fullPage: true }).catch(() => {});
+    throw err;
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});

@@ -21,7 +21,7 @@ const stockOf = (reply, code) => reply.state.products.find((p) => p.barcode === 
 
 test('creates all tabs and removes the blank one', () => {
   const b = createBackend();
-  assert.deepEqual(b.tabs().sort(), ['Журнал', 'Остатки', 'Пакеты', 'По дням', 'По дням подробно', 'Продукты']);
+  assert.deepEqual(b.tabs().sort(), ['Деньги', 'Деньги по дням', 'Журнал', 'Люди', 'Люди по дням', 'Остатки', 'Пакеты', 'По дням', 'По дням подробно', 'Продукты']);
 });
 
 test('the sheet is in Russian, and the app still gets fixed status codes', () => {
@@ -59,7 +59,7 @@ test('notes and contents in the sheet are in Russian', () => {
 test('setup removes the blank first tab on a Russian Google account too', () => {
   const b = createBackend({ blankName: 'Лист1' });
   assert.equal(b.tabs().includes('Лист1'), false);
-  assert.equal(b.tabs().length, 6);
+  assert.equal(b.tabs().length, 10);
 });
 
 test('the script only asks for access to its own spreadsheet', () => {
@@ -493,4 +493,168 @@ test('writing past the sheet\'s last row adds rows', () => {
   b.tab('Журнал').maxRows = b.tab('Журнал').getLastRow();
   const reply = b.call('receive', { opId: op(), barcode: BEANS, qty: 1 });
   assert.equal(reply.ok, true);
+});
+
+/* ---------- Money and people ---------- */
+
+const NOV_7 = () => new Date('2026-11-07T12:00:00Z');
+
+test('the old money table pastes in and adds up', () => {
+  const b = createBackend({ date: NOV_7 });
+  b.tab('Деньги').getRange(2, 1, 8, 3).setValues([
+    [5000, '04.11.2026', ''], [2000, '04.11.2026', ''], [-3200, '04.11.2026', 'лекарства Бабуле'],
+    [5000, '04.11.2026', ''], [5000, '04.11.2026', ''], [2000, '05.11.2026', ''],
+    [-1666, '05.11.2026', 'закуп'], [-3500, '05.11.2026', 'лекарства андрей лк'],
+  ]);
+  b.context.onEdit({ range: { getSheet: () => b.tab('Деньги') } });
+
+  assert.deepEqual(b.tab('Деньги по дням').rows(), [
+    { 'Дата': '05.11.2026', 'Пришло': 2000, 'Ушло': 5166, 'Итог за день': -3166, 'Остаток': 10634 },
+    { 'Дата': '04.11.2026', 'Пришло': 17000, 'Ушло': 3200, 'Итог за день': 13800, 'Остаток': 13800 },
+  ]);
+  const money = b.call('bootstrap').state.money;
+  assert.equal(money.balance, 10634);
+  assert.deepEqual(money.badRows, []);
+  assert.deepEqual(money.recent[0], { amount: -3500, date: '2026-11-05', note: 'лекарства андрей лк' });
+  assert.equal(money.recent.length, 8);
+});
+
+test('the old people table pastes in, with empty counts as zero and short dates', () => {
+  const b = createBackend({ date: NOV_7 });
+  b.tab('Люди').getRange(2, 1, 5, 3).setValues([
+    ['', 2, '2.11.26'], ['', 15, '3.11.26'], [4, 3, '4.11.26'], [2, 6, '5.11.26'], [1, 4, '6.11.26'],
+  ]);
+  b.context.onEdit({ range: { getSheet: () => b.tab('Люди') } });
+
+  assert.deepEqual(b.tab('Люди по дням').rows(), [
+    { 'Дата': '06.11.2026', 'Принесли': 1, 'Взяли': 4 },
+    { 'Дата': '05.11.2026', 'Принесли': 2, 'Взяли': 6 },
+    { 'Дата': '04.11.2026', 'Принесли': 4, 'Взяли': 3 },
+    { 'Дата': '03.11.2026', 'Принесли': 0, 'Взяли': 15 },
+    { 'Дата': '02.11.2026', 'Принесли': 0, 'Взяли': 2 },
+  ]);
+  assert.deepEqual(b.call('bootstrap').state.people.days[3], { date: '2026-11-03', brought: 0, took: 15 });
+});
+
+test('pasted cells can be real dates or text numbers', () => {
+  const b = createBackend({ date: NOV_7 });
+  const asDate = new b.context.Date(Date.UTC(2026, 10, 4));
+  const sheet = b.tab('Деньги');
+  sheet.getRange(2, 1, 3, 3).setValues([[100, asDate, ''], ["'+5 000", '4/11/2026', ''], ["'\u22121200,50", '2026-11-04', '']]);
+  const money = b.call('bootstrap').state.money;
+  assert.deepEqual(money.badRows, []);
+  assert.equal(money.balance, 3900 - 0.5 + 0);
+});
+
+test('rows that cannot be read are reported and left out of the totals', () => {
+  const b = createBackend({ date: NOV_7 });
+  b.tab('Деньги').getRange(2, 1, 6, 3).setValues([
+    [100, '04.11.2026', ''],
+    ['Сумма', 'Дата', 'Примечание'],
+    [100, '32.11.2026', ''],
+    [100, '', ''],
+    ["'5,000", '04.11.2026', ''],
+    ['', '', ''],
+  ]);
+  b.tab('Люди').getRange(2, 1, 2, 3).setValues([[1.5, 2, '04.11.26'], [1, 2, 'вчера']]);
+  const state = b.call('bootstrap').state;
+  assert.equal(state.money.balance, 100);
+  assert.deepEqual(state.money.badRows, [3, 4, 5, 6]);
+  assert.deepEqual(state.people.badRows, [2, 3]);
+});
+
+test('money can be added and undone, and a retry does not count twice', () => {
+  const b = createBackend({ date: NOV_7 });
+  const id = op();
+  b.call('money', { opId: id, amount: 5000, note: 'взнос' });
+  const retry = b.call('money', { opId: id, amount: 5000, note: 'взнос' });
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.state.money.balance, 5000);
+  b.call('money', { opId: op(), amount: -1200, date: '2026-11-05', note: '=закуп' });
+
+  const rows = b.tab('Деньги').rows();
+  assert.equal(rows[0]['Сумма'], 5000);
+  assert.equal(rows[0]['Дата'], '07.11.2026');
+  assert.equal(rows[1]['Дата'], '05.11.2026');
+  assert.equal(rows[1]['Примечание'], '=закуп');
+  assert.equal(typeof rows[1]['Примечание'], 'string');
+  assert.ok(!Object.keys(rows[0]).some((k) => /волонт/i.test(k)), 'no names in the ledger');
+  assert.ok(!JSON.stringify(rows).includes('Sam'), 'no names in the ledger');
+
+  const undone = b.call('undo', { opId: op(), targetOp: id });
+  assert.equal(undone.state.money.balance, -1200);
+  assert.equal(b.tab('Деньги').rows().length, 3);
+  assert.equal(b.tab('Деньги').rows()[2]['Сумма'], -5000);
+  assert.equal(b.tab('Деньги').rows()[2]['Примечание'], 'Отмена: взнос');
+  assert.deepEqual(undone.state.money.recent.map((r) => r.amount), [-1200]);
+
+  const again = b.call('undo', { opId: op(), targetOp: id });
+  assert.equal(again.result.alreadyUndone, true);
+  assert.equal(again.state.money.balance, -1200);
+  assert.equal(b.tab('Деньги по дням').rows()[0]['Остаток'], -1200);
+});
+
+test('money refuses amounts and dates that make no sense', () => {
+  const b = createBackend({ date: NOV_7 });
+  for (const amount of [0, 1.5, 'abc', '', 1e12]) assert.equal(b.call('money', { opId: op(), amount }).key, 'badAmount', String(amount));
+  for (const date of ['2026-11-08', '31.02.2026', 'soon']) assert.equal(b.call('money', { opId: op(), amount: 5, date }).key, 'badDate', date);
+  assert.equal(b.tab('Деньги').rows().length, 0);
+});
+
+test('people are counted per day and cannot go below zero', () => {
+  const b = createBackend({ date: NOV_7 });
+  const id = op();
+  b.call('people', { opId: id, field: 'took', delta: 3 });
+  assert.equal(b.call('people', { opId: id, field: 'took', delta: 3 }).replayed, true);
+  b.call('people', { opId: op(), field: 'brought', delta: 1 });
+  b.call('people', { opId: op(), field: 'took', delta: -1 });
+  const past = b.call('people', { opId: op(), field: 'brought', delta: 2, date: '2026-11-03' });
+  assert.deepEqual(past.state.people.days, [
+    { date: '2026-11-07', brought: 1, took: 2 },
+    { date: '2026-11-03', brought: 2, took: 0 },
+  ]);
+  assert.equal(b.call('people', { opId: op(), field: 'brought', delta: -2 }).key, 'peopleBelowZero');
+  assert.equal(b.call('people', { opId: op(), field: 'nobody', delta: 1 }).ok, false);
+  assert.ok(!JSON.stringify(b.tab('Люди').rows()).includes('Sam'), 'no names in the ledger');
+  assert.deepEqual(b.tab('Люди по дням').rows()[0], { 'Дата': '07.11.2026', 'Принесли': 1, 'Взяли': 2 });
+});
+
+test('a sheet set up before these tabs existed gets them when the app connects', () => {
+  const b = createBackend({ date: NOV_7 });
+  const ss = b.context.SpreadsheetApp.getActiveSpreadsheet();
+  ['Деньги', 'Деньги по дням', 'Люди', 'Люди по дням'].forEach((name) => ss.deleteSheet(b.tab(name)));
+  assert.equal(b.call('bootstrap').ok, true);
+  assert.ok(b.tabs().includes('Деньги'));
+  assert.equal(b.call('money', { opId: op(), amount: 10 }).state.money.balance, 10);
+  assert.equal(b.tab('Деньги по дням').rows()[0]['Остаток'], 10);
+});
+
+/* ---------- Correcting a count ---------- */
+
+test('a wrong count can be corrected, leaving a record, and undone', () => {
+  const b = seeded();
+  const id = op();
+  const fixed = b.call('adjust', { opId: id, barcode: BEANS, available: 7, expected: 10 });
+  assert.equal(stockOf(fixed, BEANS).available, 7);
+  const row = b.tab('Журнал').rows().at(-1);
+  assert.equal(row['Действие'], 'Получено');
+  assert.equal(row['Кол-во'], -3);
+  assert.equal(row['Примечание'], 'Исправление количества');
+  assert.equal(b.tab('Остатки').rows().find((r) => r['Штрихкод'] === BEANS)['В наличии'], 7);
+
+  assert.equal(b.call('adjust', { opId: id, barcode: BEANS, available: 7, expected: 10 }).replayed, true);
+  assert.equal(stockOf(b.call('bootstrap'), BEANS).available, 7);
+
+  assert.equal(stockOf(b.call('undo', { opId: op(), targetOp: id }), BEANS).available, 10);
+  assert.equal(stockOf(b.call('adjust', { opId: op(), barcode: BEANS, available: 12, expected: 10 }), BEANS).available, 12);
+});
+
+test('a correction is refused if someone else just changed the count, or the number is wrong', () => {
+  const b = seeded();
+  const stale = b.call('adjust', { opId: op(), barcode: BEANS, available: 5, expected: 9 });
+  assert.equal(stale.key, 'stockChanged');
+  assert.equal(stale.params.n, 10);
+  for (const available of [-1, 1.5, 'x']) assert.equal(b.call('adjust', { opId: op(), barcode: BEANS, available, expected: 10 }).key, 'badAmountOnHand');
+  assert.equal(b.call('adjust', { opId: op(), barcode: '123456', available: 1, expected: 0 }).key, 'notReceived');
+  assert.equal(stockOf(b.call('adjust', { opId: op(), barcode: BEANS, available: 0, expected: 10 }), BEANS).available, 0);
 });

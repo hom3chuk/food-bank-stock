@@ -319,7 +319,7 @@ async function undo(targetOp) {
   const reply = await request('undo', { opId, targetOp });
   if (!reply) return;
   if (app.tab === 'receive') app.view.receive = null;
-  app.notice = { kind: 'good', text: say('common.undone') };
+  app.notice = { kind: 'good', text: say(app.tab === 'money' ? 'money.undone' : 'common.undone') };
   render();
 }
 
@@ -1259,8 +1259,210 @@ function stockScreen() {
         onPick: (p) => h('div.row', { style: 'display:block' },
           h('div.row-title', null, p.name),
           h('div.muted', null, categoryLabel(p.category)),
-          countsEl(p)),
+          countsEl(p),
+          h('button.btn.btn-small', { type: 'button', onclick: () => openAdjust(p) }, t('stock.editAmount'))),
       })),
+  ];
+}
+
+/* A popup, so a stray tap while scrolling the list can't change a count. */
+function openAdjust(p) {
+  const qty = qtyInput(Math.max(0, p.available), 0);
+  const dialog = h('dialog', { style: 'width:min(92vw,520px);max-height:90vh;border:0;border-radius:12px;padding:16px' },
+    h('form', {
+      style: 'display:grid;gap:12px',
+      onsubmit: async (event) => {
+        event.preventDefault();
+        const available = qty.read();
+        if (available === null) { qty.el.querySelector('input').focus(); return; }
+        // Closed first, because a popup would cover any error message.
+        dialog.close();
+        if (available === p.available) return;
+        const reply = await request('adjust', { opId: newOpId(), barcode: p.barcode, available, expected: p.available });
+        if (!reply) return;
+        app.notice = { kind: 'good', text: say('stock.adjusted', { name: p.name, n: available }), undoOp: reply.opId };
+        render();
+      },
+    },
+    h('h2', null, p.name),
+    h('p.muted', null, t('stock.adjustIntro', { n: p.available })),
+    h('label', null, t('stock.newAmount'), qty.el),
+    h('button.btn.primary', { type: 'submit' }, t('common.save')),
+    h('button.btn', { type: 'button', onclick: () => dialog.close() }, t('common.cancel'))));
+  dialog.addEventListener('close', () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+/* ---------- People and money ---------- */
+
+function formatDate(iso) {
+  const [y, m, d] = String(iso).split('-');
+  return `${d}.${m}.${y}`;
+}
+
+function formatMoney(amount) {
+  return new Intl.NumberFormat(htmlLang(), { maximumFractionDigits: 2 }).format(amount);
+}
+
+function signedMoney(amount) {
+  return amount > 0 ? `+${formatMoney(amount)}` : formatMoney(amount);
+}
+
+/* A warning for rows pasted into the sheet that can't be read, because they aren't being counted. */
+function badRowsNote(tab, rows) {
+  if (!rows || !rows.length) return null;
+  return h('div.notice.warn', null, h('span', null, t('ledger.badRows', { tab, rows: rows.join(', ') })));
+}
+
+/*
+ * A save takes a second or two, and people often come in groups. So taps count on screen straight
+ * away, and are sent together once the tapping pauses.
+ */
+const peopleTaps = { pending: {}, timer: null, sending: false, onChange: () => {} };
+
+function peopleCount(date, field) {
+  const day = ((app.data && app.data.people && app.data.people.days) || []).find((d) => d.date === date);
+  return (day ? day[field] : 0) + (peopleTaps.pending[`${date}|${field}`] || 0);
+}
+
+function tapPeople(date, field, by) {
+  if (peopleCount(date, field) + by < 0) return;
+  const key = `${date}|${field}`;
+  peopleTaps.pending[key] = (peopleTaps.pending[key] || 0) + by;
+  if (!peopleTaps.pending[key]) delete peopleTaps.pending[key];
+  peopleTaps.onChange();
+  clearTimeout(peopleTaps.timer);
+  peopleTaps.timer = setTimeout(sendPeopleTaps, 800);
+}
+
+async function sendPeopleTaps() {
+  clearTimeout(peopleTaps.timer);
+  if (peopleTaps.sending) return;
+  peopleTaps.sending = true;
+  try {
+    for (let key = Object.keys(peopleTaps.pending)[0]; key; key = Object.keys(peopleTaps.pending)[0]) {
+      const [date, field] = key.split('|');
+      const delta = peopleTaps.pending[key];
+      try {
+        await api('people', { opId: newOpId(), date, field, delta });
+        // More taps may have come in while this was saving.
+        peopleTaps.pending[key] -= delta;
+        if (!peopleTaps.pending[key]) delete peopleTaps.pending[key];
+      } catch (err) {
+        delete peopleTaps.pending[key];
+        if (err.code === 'BAD_PASSCODE') {
+          signOut(say('err.passcodeChanged'));
+          return;
+        }
+        showNotice('bad', err.say);
+      }
+      peopleTaps.onChange();
+    }
+  } finally {
+    peopleTaps.sending = false;
+  }
+}
+
+// Sends the last taps if the phone is locked or the app is closed straight after tapping.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') sendPeopleTaps();
+});
+
+function peopleScreen() {
+  const data = app.data.people || { days: [], badRows: [] };
+  const today = app.data.today || new Date().toISOString().slice(0, 10);
+  if (!app.view.peopleDate) app.view.peopleDate = today;
+
+  const dateInput = h('input', {
+    type: 'date', value: app.view.peopleDate, max: today,
+    onchange: () => { app.view.peopleDate = dateInput.value || today; draw(); },
+  });
+  const counters = ['brought', 'took'].map((field) => {
+    const number = h('strong.people-number');
+    const label = t(field === 'brought' ? 'people.brought' : 'people.took');
+    return {
+      field,
+      number,
+      el: h('div.people-counter', null,
+        h('div.row-title', null, label),
+        h('div.people-stepper', null,
+          h('button', { type: 'button', 'aria-label': `${label}: ${t('common.oneFewer')}`, onclick: () => tapPeople(app.view.peopleDate, field, -1) }, '−'),
+          number,
+          h('button', { type: 'button', 'aria-label': `${label}: ${t('common.oneMore')}`, onclick: () => tapPeople(app.view.peopleDate, field, 1) }, '+'))),
+    };
+  });
+  const list = h('div.list');
+
+  function draw() {
+    if (!list.isConnected && list.childElementCount) return;
+    counters.forEach((c) => { c.number.textContent = String(peopleCount(app.view.peopleDate, c.field)); });
+    const days = (app.data && app.data.people && app.data.people.days) || [];
+    list.replaceChildren(...(days.length
+      ? [h('div.day-row.day-head.muted', null, h('span', null, t('common.date')), h('span', null, t('people.brought')), h('span', null, t('people.took'))),
+        ...days.slice(0, 14).map((d) => h('div.day-row', null, h('span', null, formatDate(d.date)), h('b', null, String(d.brought)), h('b', null, String(d.took))))]
+      : [h('p.muted', null, t('people.empty'))]));
+  }
+  peopleTaps.onChange = draw;
+  draw();
+
+  return [
+    badRowsNote('Люди', data.badRows),
+    h('div.card', null,
+      h('h2', null, t('people.title')),
+      h('label', null, t('common.date'), dateInput),
+      counters.map((c) => c.el)),
+    h('div.card', null, h('h3', null, t('people.recent')), list),
+  ];
+}
+
+function moneyScreen() {
+  const data = app.data.money || { balance: 0, recent: [], badRows: [] };
+  const today = app.data.today || new Date().toISOString().slice(0, 10);
+  const amount = h('input', { type: 'number', inputmode: 'numeric', min: '1', step: '1', autocomplete: 'off' });
+  const note = h('input', { maxlength: '200', autocomplete: 'off' });
+  const date = h('input', { type: 'date', value: today, max: today });
+
+  async function save(sign) {
+    const n = Number(amount.value);
+    if (!amount.value || !Number.isInteger(n) || n <= 0) {
+      showNotice('warn', say('money.enterAmount'));
+      return;
+    }
+    const entry = { amount: sign * n, date: date.value || today, note: note.value };
+    // Trying again after a lost connection must not save it twice. Two equal gifts in a row are
+    // still two entries, because the ID is dropped once a save succeeds.
+    const key = JSON.stringify(entry);
+    if (!app.view.moneyTry || app.view.moneyTry.key !== key) app.view.moneyTry = { key, opId: newOpId() };
+    const reply = await request('money', { ...entry, opId: app.view.moneyTry.opId });
+    if (!reply) return;
+    app.view.moneyTry = null;
+    beep();
+    app.notice = { kind: 'good', text: say('money.saved', { amount: signedMoney(entry.amount) }), undoOp: reply.opId };
+    render();
+  }
+
+  return [
+    badRowsNote('Деньги', data.badRows),
+    h('div.card', null,
+      h('h2', null, t('money.title')),
+      h('div.balance', null, h('span.muted', null, t('money.balance')), h('strong', { class: data.balance < 0 ? 'short' : '' }, formatMoney(data.balance))),
+      h('form', { style: 'display:grid;gap:12px', onsubmit: (event) => event.preventDefault() },
+        h('label', null, t('money.amount'), amount),
+        h('label', null, t('money.note'), note),
+        h('label', null, t('common.date'), date),
+        h('div.money-actions', null,
+          h('button.btn.primary', { type: 'button', onclick: () => save(1) }, t('money.in')),
+          h('button.btn.danger', { type: 'button', onclick: () => save(-1) }, t('money.out'))))),
+    h('div.card', null,
+      h('h3', null, t('money.recent')),
+      h('div.list', null, data.recent.length
+        ? data.recent.map((r) => h('div.row', null,
+          h('div.row-main', null,
+            h('div.muted', null, formatDate(r.date)),
+            r.note ? h('div', null, r.note) : null),
+          h(r.amount < 0 ? 'b.short' : 'b.money-in', null, signedMoney(r.amount))))
+        : h('p.muted', null, t('money.empty')))),
   ];
 }
 
@@ -1313,6 +1515,8 @@ const TABS = [
   ['pack', packScreen],
   ['give', giveScreen],
   ['stock', stockScreen],
+  ['people', peopleScreen],
+  ['money', moneyScreen],
 ];
 
 function switchTab(tab) {
@@ -1322,7 +1526,7 @@ function switchTab(tab) {
   app.view.edit = null;
   if (tab === 'receive') app.view.receive = null;
   render();
-  if (tab === 'give' || tab === 'stock') refreshInBackground();
+  if (['give', 'stock', 'people', 'money'].includes(tab)) refreshInBackground();
 }
 
 function render() {

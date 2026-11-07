@@ -51,8 +51,8 @@ nav {
   padding-bottom: env(safe-area-inset-bottom);
   z-index: 5;
 }
-nav div { max-width: 560px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); }
-nav button { background: none; border: 0; border-top: 3px solid transparent; font: inherit; font-size: 15px; font-weight: 600; color: var(--muted); padding: 16px 2px; cursor: pointer; }
+nav div { max-width: 560px; margin: 0 auto; display: grid; grid-template-columns: repeat(6, 1fr); }
+nav button { background: none; border: 0; border-top: 3px solid transparent; font: inherit; font-size: clamp(11px, 3.3vw, 15px); font-weight: 600; color: var(--muted); padding: 16px 2px; cursor: pointer; }
 nav button.active { color: var(--brand); border-top-color: var(--brand); background: var(--brand-soft); }
 
 h2 { font-size: 22px; line-height: 1.2; margin: 0; }
@@ -119,6 +119,22 @@ button.row { width: 100%; background: none; border-left: 0; border-right: 0; bor
 .count.packed b { color: var(--packed); }
 .count.given b { color: var(--given); }
 .count.negative b { color: var(--danger); }
+
+.btn-small { min-height: 44px; padding: 8px 12px; margin-top: 8px; font-size: 15px; }
+
+.people-counter { display: grid; gap: 8px; }
+.people-stepper { display: grid; grid-template-columns: 76px 1fr 76px; gap: 10px; align-items: center; text-align: center; }
+.people-stepper button { min-height: 72px; font-size: 32px; font-weight: 600; border-radius: 10px; border: 1px solid var(--line); background: var(--brand-soft); color: var(--brand); cursor: pointer; }
+.people-number { font-size: 40px; line-height: 1; }
+.day-row { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+.day-head { border-top: 0; font-size: 14px; }
+.day-row > :not(:first-child) { text-align: right; }
+
+.balance { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.balance strong { font-size: 32px; overflow-wrap: anywhere; }
+.money-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.money-in { color: var(--available); }
+.short { color: var(--danger); }
 
 .segmented { display: grid; grid-template-columns: 1fr 1fr; background: #e5e8e1; border-radius: 10px; padding: 3px; }
 .segmented button { min-height: 44px; border: 0; background: none; border-radius: 8px; font: inherit; font-size: 15px; font-weight: 600; color: var(--muted); cursor: pointer; }

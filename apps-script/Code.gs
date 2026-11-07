@@ -20,7 +20,13 @@
  *   GIVEN_OUT (no packet) available -qty, given out +qty
  * An item handed back from a packet during a handout is an UNPACKED row for just that item.
  * Editing a packet on the shelf is PACKED rows for what went in and UNPACKED rows for what came out.
+ * A correction on the Stock screen is a RECEIVED row for the difference, marked CORRECTION_NOTE.
  * Undo appends the same rows with a negative qty, so history is never erased.
+ *
+ * Money and people have their own ledgers (TABS.MONEY, TABS.PEOPLE), with no names in them. Their
+ * first columns match the old paper-style table, so past data can be pasted straight in. Pasted
+ * rows have no time or operation ID, and their dates and numbers may arrive as text, so those
+ * tabs are read with parseDate_ and parseAmount_. A row that can't be read is reported, not guessed.
  */
 
 const TABS = {
@@ -30,6 +36,10 @@ const TABS = {
   PACKETS: 'Пакеты',
   PRODUCTS: 'Продукты',
   LOG: 'Журнал',
+  MONEY: 'Деньги',
+  MONEY_DAILY: 'Деньги по дням',
+  PEOPLE: 'Люди',
+  PEOPLE_DAILY: 'Люди по дням',
 };
 
 const TEXT = '@';
@@ -64,6 +74,21 @@ const COLUMNS = {
     ['Пакет', 'packet', NUM], ['Волонтёр', 'volunteer', TEXT], ['Примечание', 'note', TEXT],
     ['ID операции', 'op', TEXT],
   ],
+  [TABS.MONEY]: [
+    ['Сумма', 'amount', NUM], ['Дата', 'date', TEXT], ['Примечание', 'note', TEXT],
+    ['Время записи', 'timestamp', TEXT], ['ID операции', 'op', TEXT],
+  ],
+  [TABS.MONEY_DAILY]: [
+    ['Дата', 'date', TEXT], ['Пришло', 'moneyIn', NUM], ['Ушло', 'moneyOut', NUM],
+    ['Итог за день', 'net', NUM], ['Остаток', 'balance', NUM],
+  ],
+  [TABS.PEOPLE]: [
+    ['Принесли', 'brought', NUM], ['Взяли', 'took', NUM], ['Дата', 'date', TEXT],
+    ['Время записи', 'timestamp', TEXT], ['ID операции', 'op', TEXT],
+  ],
+  [TABS.PEOPLE_DAILY]: [
+    ['Дата', 'date', TEXT], ['Принесли', 'brought', NUM], ['Взяли', 'took', NUM],
+  ],
 };
 
 const ACTION = { RECEIVED: 'Получено', PACKED: 'Упаковано', UNPACKED: 'Распаковано', GIVEN_OUT: 'Выдано' };
@@ -76,12 +101,16 @@ STATUS_CODES[PACKET.UNPACKED] = 'Unpacked';
 const EDIT_NOTE = 'Изменено';
 const HANDED_BACK_NOTE = 'Возвращено';
 const UNDO_NOTE = 'Отмена';
+const CORRECTION_NOTE = 'Исправление количества';
 const UNKNOWN_VOLUNTEER = 'Неизвестно';
 const SORT_LOCALE = 'ru';
 const BLANK_TAB_NAMES = ['Sheet1', 'Лист1'];
 const MAX_QTY = 100000;
 const MAX_PACKETS_AT_ONCE = 500;
 const MIN_PASSCODE_LENGTH = 6;
+const MAX_AMOUNT = 100000000;
+const MAX_PEOPLE_CHANGE = 1000;
+const RECENT_MONEY_ROWS = 30;
 
 /* ---------- Web API ---------- */
 
@@ -123,7 +152,7 @@ function checkPasscode_(given) {
 }
 
 function dispatch_(req) {
-  const writes = { receive: receive_, pack: pack_, editPacket: editPacket_, handout: handout_, unpack: unpack_, undo: undo_ };
+  const writes = { receive: receive_, pack: pack_, editPacket: editPacket_, handout: handout_, unpack: unpack_, undo: undo_, money: money_, people: people_, adjust: adjust_ };
   if (req.action === 'bootstrap') return { ok: true, state: state_(load_()) };
   const handler = writes[req.action];
   if (!handler) throw new ApiError('BAD_REQUEST', 'generic');
@@ -142,9 +171,12 @@ function dispatch_(req) {
     // A retry after a lost connection must not count the same donation twice.
     const prior = db.log.filter(function (r) { return r.op === op; });
     if (prior.length) return { ok: true, replayed: true, opId: op, result: resultFromRows_(prior), state: state_(db) };
+    if (ledgerHasOp_(db, op)) return { ok: true, replayed: true, opId: op, result: { action: 'LEDGER' }, state: state_(db) };
 
     const result = handler(req, db, { op: op, volunteer: cleanText_(req.volunteer, 60) || UNKNOWN_VOLUNTEER, now: now_() });
-    rebuildViews_(db);
+    // Counting a person should be quick, and it can't change the stock tabs.
+    if (req.action === 'money' || req.action === 'people') rebuildLedgerViews_(db);
+    else rebuildViews_(db);
     return { ok: true, opId: op, result: result, state: state_(db) };
   } finally {
     lock.releaseLock();
@@ -319,8 +351,74 @@ function unpack_(req, db, ctx) {
   return { action: ACTION.UNPACKED, numbers: [packet.number], contents: packet.contents };
 }
 
+/** Sets how many are available. Checks the count the volunteer saw, in case someone else just changed it. */
+function adjust_(req, db, ctx) {
+  const code = normBarcode_(req.barcode);
+  const product = findProduct_(db, code);
+  if (!product) throw new ApiError('NOT_FOUND', 'notReceived', { code: code });
+  const target = Number(req.available);
+  if (!Number.isInteger(target) || target < 0 || target > MAX_QTY) throw new ApiError('BAD_REQUEST', 'badAmountOnHand');
+  const current = (computeStock_(db.log)[code] || { available: 0 }).available;
+  if (current !== Number(req.expected)) throw new ApiError('CONFLICT', 'stockChanged', { name: product.name, n: current });
+  const change = target - current;
+  if (change) addLog_(db, ctx, [{ action: ACTION.RECEIVED, barcode: code, name: product.name, qty: change, note: CORRECTION_NOTE }]);
+  return { action: 'ADJUST', barcode: code, name: product.name, available: target };
+}
+
+function money_(req, db, ctx) {
+  const amount = Number(req.amount);
+  if (!Number.isInteger(amount) || amount === 0 || Math.abs(amount) > MAX_AMOUNT) throw new ApiError('BAD_REQUEST', 'badAmount');
+  const date = entryDate_(req.date, ctx);
+  addMoney_(db, ctx, { amount: amount, date: date, note: cleanText_(req.note, 200) });
+  return { action: 'MONEY', amount: amount, date: date };
+}
+
+function people_(req, db, ctx) {
+  const delta = Number(req.delta);
+  const field = req.field === 'brought' || req.field === 'took' ? req.field : '';
+  if (!field || !Number.isInteger(delta) || delta === 0 || Math.abs(delta) > MAX_PEOPLE_CHANGE) throw new ApiError('BAD_REQUEST', 'generic');
+  const date = entryDate_(req.date, ctx);
+  const day = peopleDays_(db.people.entries)[date] || { brought: 0, took: 0 };
+  if (day[field] + delta < 0) throw new ApiError('CONFLICT', 'peopleBelowZero');
+
+  const row = { brought: field === 'brought' ? delta : '', took: field === 'took' ? delta : '', date: sheetDate_(date), timestamp: ctx.now.timestamp, op: ctx.op };
+  appendRows_(TABS.PEOPLE, [row]);
+  db.people.entries.push({ brought: field === 'brought' ? delta : 0, took: field === 'took' ? delta : 0, date: date, op: ctx.op });
+  return { action: 'PEOPLE', date: date };
+}
+
+function addMoney_(db, ctx, entry) {
+  appendRows_(TABS.MONEY, [{ amount: entry.amount, date: sheetDate_(entry.date), note: entry.note, timestamp: ctx.now.timestamp, op: ctx.op }]);
+  db.money.entries.push({ amount: entry.amount, date: entry.date, note: entry.note, op: ctx.op });
+}
+
+function undoMoney_(db, ctx, target, rows) {
+  const undoOp = target + ':undo';
+  if (db.money.entries.some(function (r) { return r.op === undoOp; })) return { action: 'UNDO', alreadyUndone: true };
+  // Keeps the original date, so that day's total comes out right in the report.
+  rows.forEach(function (r) {
+    addMoney_(db, Object.assign({}, ctx, { op: undoOp }), { amount: -r.amount, date: r.date, note: UNDO_NOTE + (r.note ? ': ' + r.note : '') });
+  });
+  return { action: 'UNDO' };
+}
+
+function ledgerHasOp_(db, op) {
+  const same = function (r) { return r.op === op; };
+  return db.money.entries.some(same) || db.people.entries.some(same);
+}
+
+function entryDate_(value, ctx) {
+  if (value === undefined || value === null || value === '') return ctx.now.date;
+  const date = parseDate_(value);
+  // Dates in this format sort correctly as text.
+  if (!date || date > ctx.now.date) throw new ApiError('BAD_REQUEST', 'badDate');
+  return date;
+}
+
 function undo_(req, db, ctx) {
   const target = String(req.targetOp || '');
+  const moneyRows = db.money.entries.filter(function (r) { return r.op === target; });
+  if (moneyRows.length && target.indexOf(':undo') === -1) return undoMoney_(db, ctx, target, moneyRows);
   const rows = db.log.filter(function (r) { return r.op === target; });
   if (!target || !rows.length) throw new ApiError('NOT_FOUND', 'undoNotFound');
   if (target.indexOf(':undo') !== -1) throw new ApiError('BAD_REQUEST', 'undoNotFound');
@@ -514,6 +612,84 @@ function cleanText_(value, maxLength) {
   return /^[=+\-@]/.test(text) ? "'" + text : text;
 }
 
+/* ---------- Reading pasted data ---------- */
+
+/** Reads a date cell as yyyy-MM-dd, or returns '' if it isn't a real date. Day comes first: 04.11.2026, 2.11.26. */
+function parseDate_(value) {
+  const text = String(value === undefined || value === null ? '' : value).trim();
+  let y, m, d;
+  let parts = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (parts) {
+    y = Number(parts[1]); m = Number(parts[2]); d = Number(parts[3]);
+  } else {
+    parts = text.match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4}|\d{2})$/);
+    if (!parts) return '';
+    d = Number(parts[1]); m = Number(parts[2]); y = Number(parts[3]);
+    if (parts[3].length === 2) y += 2000;
+  }
+  if (m < 1 || m > 12 || d < 1 || d > new Date(Date.UTC(y, m, 0)).getUTCDate()) return '';
+  return y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+}
+
+/** The form dates take in the sheet, matching the old table. */
+function sheetDate_(date) {
+  const parts = date.split('-');
+  return parts[2] + '.' + parts[1] + '.' + parts[0];
+}
+
+/** Reads a number cell, or returns null. A comma before three digits could mean thousands, so it counts as unreadable. */
+function parseAmount_(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const text = String(value === undefined || value === null ? '' : value).replace(/\s/g, '').replace(/\u2212/g, '-');
+  if (!/^[+-]?\d+([.,]\d{1,2})?$/.test(text)) return null;
+  return Number(text.replace(',', '.'));
+}
+
+function readMoney_() {
+  const out = { entries: [], badRows: [] };
+  readTable_(TABS.MONEY).forEach(function (r) {
+    if (r.amount === '' && !r.date && !r.note) return;
+    const amount = parseAmount_(r.amount);
+    const date = parseDate_(r.date);
+    if (amount === null || !date) out.badRows.push(r.row);
+    else out.entries.push({ row: r.row, amount: amount, date: date, note: r.note, op: r.op });
+  });
+  return out;
+}
+
+function readPeople_() {
+  const out = { entries: [], badRows: [] };
+  readTable_(TABS.PEOPLE).forEach(function (r) {
+    if (r.brought === '' && r.took === '' && !r.date) return;
+    // The old table leaves a count empty when it was zero.
+    const brought = r.brought === '' ? 0 : parseAmount_(r.brought);
+    const took = r.took === '' ? 0 : parseAmount_(r.took);
+    const date = parseDate_(r.date);
+    if (!Number.isInteger(brought) || !Number.isInteger(took) || !date) out.badRows.push(r.row);
+    else out.entries.push({ row: r.row, brought: brought, took: took, date: date, op: r.op });
+  });
+  return out;
+}
+
+function peopleDays_(entries) {
+  const days = {};
+  entries.forEach(function (r) {
+    const day = days[r.date] || (days[r.date] = { date: r.date, brought: 0, took: 0 });
+    day.brought += r.brought;
+    day.took += r.took;
+  });
+  return days;
+}
+
+function newestFirst_(a, b) {
+  return b.date < a.date ? -1 : b.date > a.date ? 1 : 0;
+}
+
+/** Adding cents can leave tiny errors like 0.30000000000000004. */
+function roundMoney_(n) {
+  return Math.round(n * 100) / 100;
+}
+
 /* ---------- Sheet access ---------- */
 
 function sheet_(tab) {
@@ -546,7 +722,15 @@ function readTable_(tab) {
 }
 
 function load_() {
-  return { products: readTable_(TABS.PRODUCTS), log: readTable_(TABS.LOG), packets: readTable_(TABS.PACKETS) };
+  // A sheet set up before these tabs existed gets them here, so updating the script can't break the app.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  [TABS.MONEY, TABS.MONEY_DAILY, TABS.PEOPLE, TABS.PEOPLE_DAILY].forEach(function (tab) {
+    if (!ss.getSheetByName(tab)) ensureTab_(ss, tab);
+  });
+  return {
+    products: readTable_(TABS.PRODUCTS), log: readTable_(TABS.LOG), packets: readTable_(TABS.PACKETS),
+    money: readMoney_(), people: readPeople_(),
+  };
 }
 
 function toValues_(tab, objects) {
@@ -648,6 +832,35 @@ function rebuildViews_(db) {
   replaceTable_(TABS.STOCK, stockRows);
   replaceTable_(TABS.DAILY, dailyRows);
   replaceTable_(TABS.DETAIL, detailRows);
+  rebuildLedgerViews_(db);
+}
+
+function rebuildLedgerViews_(db) {
+  const moneyDays = {};
+  db.money.entries.forEach(function (r) {
+    const day = moneyDays[r.date] || (moneyDays[r.date] = { date: r.date, moneyIn: 0, moneyOut: 0 });
+    if (r.amount > 0) day.moneyIn += r.amount;
+    else day.moneyOut -= r.amount;
+  });
+  // The balance builds up from the oldest day, and the newest day is shown first.
+  let balance = 0;
+  const moneyRows = Object.keys(moneyDays).sort().map(function (date) {
+    const day = moneyDays[date];
+    day.net = roundMoney_(day.moneyIn - day.moneyOut);
+    balance = roundMoney_(balance + day.net);
+    day.balance = balance;
+    day.date = sheetDate_(date);
+    return day;
+  }).reverse();
+
+  const peopleTotals = peopleDays_(db.people.entries);
+  const peopleRows = Object.keys(peopleTotals).sort().reverse().map(function (date) {
+    const day = peopleTotals[date];
+    return { date: sheetDate_(date), brought: day.brought, took: day.took };
+  });
+
+  replaceTable_(TABS.MONEY_DAILY, moneyRows);
+  replaceTable_(TABS.PEOPLE_DAILY, peopleRows);
 }
 
 /** The sheet says a status in Russian. The app gets a fixed code and shows it in the volunteer's language. */
@@ -655,11 +868,43 @@ function apiStatus_(status) {
   return STATUS_CODES[status] || status;
 }
 
+function moneyState_(money) {
+  const undone = {};
+  money.entries.forEach(function (r) {
+    if (String(r.op).indexOf(':undo') !== -1) {
+      undone[r.op] = true;
+      undone[String(r.op).replace(/:undo$/, '')] = true;
+    }
+  });
+  // Rows keep the order they were added, so a later row on the same date is the newer one.
+  const recent = money.entries.map(function (r, i) { return { amount: r.amount, date: r.date, note: r.note, op: r.op, order: i }; })
+    .filter(function (r) { return !r.op || !undone[r.op]; })
+    .sort(function (a, b) { return newestFirst_(a, b) || b.order - a.order; })
+    .slice(0, RECENT_MONEY_ROWS)
+    .map(function (r) { return { amount: r.amount, date: r.date, note: r.note }; });
+  return {
+    balance: roundMoney_(money.entries.reduce(function (sum, r) { return sum + r.amount; }, 0)),
+    recent: recent,
+    badRows: money.badRows,
+  };
+}
+
+function peopleState_(people) {
+  const days = peopleDays_(people.entries);
+  return {
+    days: Object.keys(days).map(function (d) { return days[d]; }).sort(newestFirst_),
+    badRows: people.badRows,
+  };
+}
+
 function state_(db) {
   const stock = computeStock_(db.log);
   const contents = contentsByPacket_(db.log);
   return {
     sheetUrl: SpreadsheetApp.getActiveSpreadsheet().getUrl(),
+    today: now_().date,
+    money: moneyState_(db.money),
+    people: peopleState_(db.people),
     products: db.products.map(function (p) {
       const s = stock[p.barcode] || { available: 0, packed: 0, given: 0 };
       return {
@@ -694,6 +939,8 @@ function onOpen() {
 function onEdit(e) {
   const tab = e && e.range && e.range.getSheet().getName();
   if (tab === TABS.LOG || tab === TABS.PRODUCTS) rebuildViews_(load_());
+  // Pasting old data counts as an edit, so the daily tabs update straight away.
+  if (tab === TABS.MONEY || tab === TABS.PEOPLE) rebuildLedgerViews_(load_());
 }
 
 function rebuildNow() {
