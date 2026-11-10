@@ -653,8 +653,74 @@ function receiveKnown(v) {
   h('button.btn', { type: 'button', onclick: () => backToScan(false) }, t('common.cancel')));
 }
 
+/* ---------- Name suggestions from Open Food Facts ---------- */
+
+const LOOKUP_URL = 'https://world.openfoodfacts.org/api/v2/product/';
+// One lookup per barcode, even if the form is drawn again, as when the language is changed.
+const lookups = new Map();
+
+function lookupName(code) {
+  if (!lookups.has(code)) {
+    // A failure is forgotten, so scanning the item again tries again.
+    lookups.set(code, fetchSuggestedName(code).catch(() => { lookups.delete(code); return ''; }));
+  }
+  return lookups.get(code);
+}
+
+/** Only the barcode leaves the phone. Returns '' when the database doesn't know the product. */
+async function fetchSuggestedName(code) {
+  if (!/^\d{8,14}$/.test(code)) return '';
+  const base = (window.FOOD_BANK_CONFIG && window.FOOD_BANK_CONFIG.lookupUrl) || LOOKUP_URL;
+  const fields = ['product_name', `product_name_${lang}`, 'product_name_en', 'brands', 'quantity'].join(',');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`${base}${code}.json?fields=${fields}`, { signal: controller.signal });
+    if (!response.ok) return '';
+    const body = await response.json();
+    return body.status === 1 ? suggestedName(body.product || {}) : '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Builds a name like "Heinz Baked Beans 415 g", in the volunteer's language when the database has it. */
+function suggestedName(p) {
+  const clean = (value) => {
+    // Some names arrive with HTML codes like &quot;. A textarea decodes them without running anything.
+    const decode = document.createElement('textarea');
+    decode.innerHTML = String(value || '');
+    return decode.value.replace(/\s+/g, ' ').trim();
+  };
+  const squash = (text) => text.toLowerCase().replace(/\s/g, '');
+  let name = clean(p[`product_name_${lang}`]) || clean(p.product_name) || clean(p.product_name_en);
+  if (!name) return '';
+  const brand = clean(String(p.brands || '').split(',')[0]);
+  if (brand && !squash(name).includes(squash(brand))) name = `${brand} ${name}`;
+  const quantity = clean(p.quantity);
+  if (quantity && !squash(name).includes(squash(quantity))) name = `${name} ${quantity}`;
+  return name.slice(0, 120);
+}
+
 function receiveNew(v) {
   const name = h('input', { required: true, maxlength: '120', autocomplete: 'off', placeholder: t('receive.namePlaceholder') });
+  const nameHint = h('p.muted', { hidden: true, 'aria-live': 'polite' });
+  // Once the volunteer types, the suggestion must not overwrite what they wrote.
+  let typed = false;
+  name.addEventListener('input', () => { typed = true; nameHint.hidden = true; });
+  if (v.code && !v.code.startsWith('NB-')) {
+    nameHint.textContent = t('receive.lookingUp');
+    nameHint.hidden = false;
+    lookupName(v.code).then((suggestion) => {
+      if (typed || name.value) return;
+      if (suggestion) {
+        name.value = suggestion;
+        nameHint.textContent = t('receive.suggested');
+      } else {
+        nameHint.hidden = true;
+      }
+    });
+  }
   const category = h('select', null,
     h('option', { value: '' }, t('receive.categoryNone')),
     CATEGORIES.map((c) => h('option', { value: STRINGS.ru['cat.' + c] }, t('cat.' + c))));
@@ -676,6 +742,7 @@ function receiveNew(v) {
     h('h2', null, v.code ? t('receive.newProduct') : t('receive.newNoBarcode')),
     h('p.muted.mono', null, v.code ? t('receive.notInSheet', { code: v.code }) : t('receive.ownCode'))),
   h('label', null, t('receive.name'), name),
+  nameHint,
   h('label', null, t('receive.category'), category),
   h('label', null, t('receive.description'), description),
   h('label', null, t('receive.howMany'), qty.el),

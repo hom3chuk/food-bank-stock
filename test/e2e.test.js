@@ -958,3 +958,94 @@ test('people, money and correcting a count work on a phone', { timeout: 120000 }
     server.close();
   }
 });
+
+test('a new barcode gets a suggested name from the product database', { timeout: 120000 }, async () => {
+  const { server, backend, lookups, url } = await startServer({
+    port: 0,
+    lookup: {
+      [BARCODE]: { product_name: 'Baked Beans', brands: 'Heinz,Kraft Heinz', quantity: '415 g' },
+      '96385074': { product_name: 'Овсяное печенье &quot;Суперзлак&quot; с изюмом', quantity: '300 g' },
+      '036000291452': { product_name: 'Earl Grey', product_name_ru: 'Чай Эрл Грей', brands: 'Ahmad Tea' },
+      '4006381333931': { product_name: 'Too slow', delay: 1500 },
+    },
+  });
+  const browser = await chromium.launch(launchOptions);
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'en-US' });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  const name = page.getByLabel('Product name');
+  const typeCode = async (value) => {
+    await page.getByLabel('Barcode number').fill(value);
+    await page.getByRole('button', { name: 'Go', exact: true }).click();
+    await page.getByRole('heading', { name: /New product|New item/ }).waitFor();
+  };
+  const cancel = () => page.getByRole('button', { name: 'Cancel' }).click();
+
+  try {
+    await page.goto(url);
+    await page.getByLabel('Your name').fill('Sam');
+    await page.getByLabel('Passcode').fill('test-passcode');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+
+    // Brand and size are added when the name doesn't already say them.
+    await typeCode(BARCODE);
+    await page.getByText('Name suggested by Open Food Facts').waitFor();
+    assert.equal(await name.inputValue(), 'Heinz Baked Beans 415 g');
+    await page.screenshot({ path: path.join(OUT, '10-suggested-name.png') });
+    // The volunteer can correct it before saving.
+    await name.fill('Heinz baked beans 415g');
+    assert.equal(await page.getByText('Name suggested by Open Food Facts').isVisible(), false);
+    await page.getByRole('button', { name: 'Add product and save' }).click();
+    await page.getByText('Added 1 × Heinz baked beans 415g.').waitFor();
+    assert.equal(backend.tab('Продукты').rows()[0]['Название'], 'Heinz baked beans 415g');
+
+    // A known product is not looked up again.
+    await page.getByLabel('Barcode number').fill(BARCODE);
+    await page.getByRole('button', { name: 'Go', exact: true }).click();
+    await page.getByRole('heading', { name: 'Heinz baked beans 415g' }).waitFor();
+    await cancel();
+    assert.deepEqual(lookups, [BARCODE]);
+
+    // HTML codes in a name are turned back into the characters they stand for.
+    await typeCode('96385074');
+    await page.getByText('Name suggested by Open Food Facts').waitFor();
+    assert.equal(await name.inputValue(), 'Овсяное печенье "Суперзлак" с изюмом 300 g');
+    await cancel();
+
+    // Nothing found leaves the form as it always was.
+    await typeCode('5000159407236');
+    await page.waitForFunction(() => document.querySelector('[aria-live="polite"]').hidden);
+    assert.equal(await name.inputValue(), '');
+    await cancel();
+
+    // Typing before the answer arrives wins over the suggestion.
+    await typeCode('4006381333931');
+    await name.fill('Highlighter pens');
+    await page.waitForTimeout(2000);
+    assert.equal(await name.inputValue(), 'Highlighter pens');
+    await cancel();
+
+    // The name comes in the volunteer's language when the database has one.
+    await page.locator('.lang-select').selectOption('ru');
+    await page.getByLabel('Номер штрихкода').fill('036000291452');
+    await page.getByRole('button', { name: 'ОК', exact: true }).click();
+    await page.getByText('Название подсказано базой Open Food Facts').waitFor();
+    assert.equal(await page.getByLabel('Название продукта').inputValue(), 'Ahmad Tea Чай Эрл Грей');
+
+    // Items with no barcode are never looked up.
+    await page.getByRole('button', { name: 'Отмена' }).click();
+    await page.getByRole('button', { name: 'Продукт без штрихкода' }).click();
+    await page.getByRole('button', { name: /Добавить новый/ }).click();
+    await page.getByLabel('Название продукта').waitFor();
+    assert.deepEqual(lookups, [BARCODE, '96385074', '5000159407236', '4006381333931', '036000291452']);
+    assert.deepEqual(errors, []);
+  } catch (err) {
+    await page.screenshot({ path: path.join(OUT, 'lookup-failure.png'), fullPage: true }).catch(() => {});
+    throw err;
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});
