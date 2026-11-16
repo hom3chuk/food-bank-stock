@@ -734,3 +734,158 @@ test('a correction is refused if someone else just changed the count, or the num
   assert.equal(b.call('adjust', { opId: op(), barcode: '123456', available: 1, expected: 0 }).key, 'notReceived');
   assert.equal(stockOf(b.call('adjust', { opId: op(), barcode: BEANS, available: 0, expected: 10 }), BEANS).available, 0);
 });
+
+/* ---------- Stock counts ---------- */
+
+const MILK = '4006381333931';
+const UNKNOWN = '3838975567009';
+
+function clock(start) {
+  const c = { now: new Date(start) };
+  c.at = (hhmm) => { c.now = new Date(`2026-11-16T${hhmm}:00Z`); return c.now.getTime(); };
+  return c;
+}
+
+/** The results tab as rows, without the empty rows next to the info cells. */
+const results = (b, n) => b.tab(`Инвентаризация-${n} итоги`).rows().filter((r) => r['Штрихкод']);
+const resultFor = (b, n, code) => results(b, n).find((r) => r['Штрихкод'] === code);
+
+test('a count gets its own tabs, and later saves of the same product add up', () => {
+  const c = clock('2026-11-16T09:00:00Z');
+  const b = seeded(() => c.now);
+  c.at('10:00');
+  const started = b.call('countStart', { opId: op(), after: 0 });
+  assert.equal(started.result.number, 1);
+  assert.ok(b.tabs().includes('Инвентаризация-1') && b.tabs().includes('Инвентаризация-1 итоги'));
+  assert.equal(started.state.count.number, 1);
+  assert.equal(started.state.count.started, '2026-11-16 10:00');
+  assert.equal(typeof started.state.count.resultsGid, 'number');
+  // Nothing counted yet, so everything is missing.
+  assert.equal(resultFor(b, 1, BEANS)['Итог'], 'Не хватает');
+
+  const first = b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 2, at: c.at('10:05') }] });
+  assert.equal(first.result.units, 2);
+  c.at('10:40');
+  b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 5, at: c.at('10:30') }, { barcode: RICE, qty: 6, at: c.at('10:31') }], volunteer: 'Ana' });
+  const beans = resultFor(b, 1, BEANS);
+  assert.equal(beans['Насчитано'], 7);
+  assert.equal(beans['Ожидалось'], 10);
+  assert.equal(beans['Разница'], -3);
+  assert.equal(beans['Итог'], 'Не хватает');
+  assert.equal(resultFor(b, 1, RICE)['Итог'], 'Сходится');
+
+  const rows = b.tab('Инвентаризация-1').rows();
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0]['Время подсчёта'], '2026-11-16 10:05');
+  assert.equal(rows[0]['Продукт'], 'Beans');
+  assert.equal(rows[1]['Волонтёр'], 'Ana');
+  assert.equal(b.tab('Инвентаризация-1').cell(0, 8).value, 'Начало');
+  // Saving a count leaves stock alone.
+  assert.equal(stockOf(b.call('bootstrap'), BEANS).available, 10);
+});
+
+test('work during a count is taken into account up to when each product was counted', () => {
+  const c = clock('2026-11-16T09:00:00Z');
+  const b = seeded(() => c.now);
+  b.call('receive', { opId: op(), barcode: MILK, qty: 3, product: { name: 'Milk' } });
+  c.at('10:00');
+  b.call('countStart', { opId: op(), after: 0 });
+
+  // Rice is counted first, then a donation of rice arrives after its shelf was done.
+  const riceAt = c.at('10:05');
+  c.at('10:10');
+  b.call('handout', { opId: op(), items: [{ barcode: BEANS, qty: 2 }] });
+  c.at('10:12');
+  b.call('pack', { opId: op(), items: [{ barcode: BEANS, qty: 1 }] });
+  c.at('10:13');
+  b.call('handout', { opId: op(), packets: [1] });
+  const beansAt = c.at('10:20');
+  c.at('10:30');
+  b.call('receive', { opId: op(), barcode: RICE, qty: 4 });
+  c.at('10:35');
+  const saved = b.call('countSave', {
+    opId: op(), number: 1,
+    items: [{ barcode: RICE, qty: 6, at: riceAt }, { barcode: BEANS, qty: 7, at: beansAt }, { barcode: UNKNOWN, name: 'Argeta 95 g', qty: 2, at: beansAt }],
+  });
+  c.at('11:00');
+  b.call('receive', { opId: op(), barcode: MILK, qty: 5 });
+  b.call('handout', { opId: op(), items: [{ barcode: BEANS, qty: 1 }] });
+
+  const beans = resultFor(b, 1, BEANS);
+  assert.deepEqual([beans['Было на начало'], beans['Изменения после начала'], beans['Ожидалось'], beans['Насчитано'], beans['Итог']], [10, -3, 7, 7, 'Сходится']);
+  const rice = resultFor(b, 1, RICE);
+  assert.deepEqual([rice['Ожидалось'], rice['Итог']], [6, 'Сходится']);
+  // Never scanned, so the milk that came after the last scan isn't expected.
+  const milk = resultFor(b, 1, MILK);
+  assert.deepEqual([milk['Ожидалось'], milk['Насчитано'], milk['Разница'], milk['Итог']], [3, 0, -3, 'Не хватает']);
+  const unknown = resultFor(b, 1, UNKNOWN);
+  assert.deepEqual([unknown['Продукт'], unknown['Ожидалось'], unknown['Итог']], ['Argeta 95 g', 0, 'Излишек']);
+  assert.deepEqual(saved.result.summary, { missing: 1, over: 1 });
+  // Biggest shortages first, then overstock, then what matched.
+  assert.deepEqual(results(b, 1).map((r) => r['Итог']), ['Не хватает', 'Излишек', 'Сходится', 'Сходится']);
+});
+
+test('a phone with a wrong clock cannot put scans before the start or in the future', () => {
+  const c = clock('2026-11-16T10:00:00Z');
+  const b = seeded(() => c.now);
+  b.call('countStart', { opId: op(), after: 0 });
+  c.at('10:30');
+  b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 1, at: Date.UTC(2026, 10, 15) }, { barcode: RICE, qty: 1, at: Date.UTC(2026, 10, 17) }, { barcode: MILK, qty: 1, at: 'x' }] });
+  assert.deepEqual(b.tab('Инвентаризация-1').rows().map((r) => r['Время подсчёта']), ['2026-11-16 10:00', '2026-11-16 10:30', '2026-11-16 10:30']);
+});
+
+test('a retried save counts once, and a save can be undone', () => {
+  const c = clock('2026-11-16T10:00:00Z');
+  const b = seeded(() => c.now);
+  b.call('countStart', { opId: op(), after: 0 });
+  const id = op();
+  const items = [{ barcode: BEANS, qty: 4 }, { barcode: BEANS, qty: 6 }];
+  b.call('countSave', { opId: id, number: 1, items });
+  assert.equal(b.call('countSave', { opId: id, number: 1, items }).result.replayed, true);
+  assert.equal(b.tab('Инвентаризация-1').rows().length, 1);
+  assert.equal(resultFor(b, 1, BEANS)['Итог'], 'Сходится');
+
+  const undone = b.call('undo', { opId: op(), targetOp: id, count: 1 });
+  assert.equal(undone.ok, true);
+  assert.equal(resultFor(b, 1, BEANS)['Насчитано'], 0);
+  assert.equal(b.tab('Инвентаризация-1').rows().at(-1)['Кол-во'], -10);
+  assert.equal(b.call('undo', { opId: op(), targetOp: id, count: 1 }).result.alreadyUndone, true);
+  assert.equal(stockOf(b.call('bootstrap'), BEANS).available, 10);
+});
+
+test('two people starting a count at once get one new count, and old counts still take saves', () => {
+  const b = seeded();
+  assert.equal(b.call('countStart', { opId: op(), after: 0 }).result.number, 1);
+  const again = b.call('countStart', { opId: op(), after: 0 });
+  assert.deepEqual([again.result.number, again.result.already], [1, true]);
+  assert.equal(b.call('countStart', { opId: op(), after: 1 }).result.number, 2);
+  assert.equal(b.call('bootstrap').state.count.number, 2);
+  assert.equal(b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 1 }] }).ok, true);
+  assert.equal(resultFor(b, 1, BEANS)['Насчитано'], 1);
+  assert.equal(results(b, 2).find((r) => r['Насчитано']), undefined);
+
+  assert.equal(b.call('countSave', { opId: op(), number: 3, items: [{ barcode: BEANS, qty: 1 }] }).key, 'countMissing');
+  assert.equal(b.call('countSave', { opId: op(), number: 1, items: [] }).ok, false);
+  assert.equal(b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 0 }] }).key, 'badQuantity');
+  assert.equal(createBackend().call('bootstrap').state.count, null);
+});
+
+test('rows typed into a count tab count too, and unreadable ones are reported', () => {
+  const c = clock('2026-11-16T10:00:00Z');
+  const b = seeded(() => c.now);
+  b.call('countStart', { opId: op(), after: 0 });
+  const tab = b.tab('Инвентаризация-1');
+  tab.getRange(2, 1, 2, 4).setValues([['2026-11-16 10:10', BEANS, '', 10], ['', RICE, '', 'много']]);
+  b.context.onEdit({ range: { getSheet: () => tab } });
+  assert.equal(resultFor(b, 1, BEANS)['Итог'], 'Сходится');
+  const info = b.tab('Инвентаризация-1 итоги');
+  assert.equal(info.cell(4, 9).value, 'Нечитаемые строки');
+  assert.equal(info.cell(4, 10).value, '3');
+
+  // A fix in Журнал updates the latest count's results.
+  const log = b.tab('Журнал');
+  const row = log.rows().findIndex((r) => r['Штрихкод'] === BEANS);
+  log.getRange(row + 2, 6, 1, 1).setValues([[12]]);
+  b.context.onEdit({ range: { getSheet: () => log } });
+  assert.equal(resultFor(b, 1, BEANS)['Итог'], 'Не хватает');
+});

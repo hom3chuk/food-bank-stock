@@ -1049,3 +1049,111 @@ test('a new barcode gets a suggested name from the product database', { timeout:
     server.close();
   }
 });
+
+test('a stock count adds up lists saved from several phones', { timeout: 120000 }, async () => {
+  const ARGETA = '3838975567009';
+  const RICE = '5098765432109';
+  const { server, backend, url } = await startServer({ port: 0, lookup: { [ARGETA]: { product_name: 'Pašteda kokošja', brands: 'Argeta', quantity: '95 g' } } });
+  backend.call('receive', { opId: 'seedop000001', barcode: BARCODE, qty: 10, product: { name: 'Beans' } });
+  backend.call('receive', { opId: 'seedop000002', barcode: RICE, qty: 6, product: { name: 'Rice' } });
+  const browser = await chromium.launch(launchOptions);
+  const phone = async (who) => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'en-US' });
+    const page = await context.newPage();
+    page.errors = [];
+    page.on('pageerror', (e) => page.errors.push(e.message));
+    page.on('dialog', (d) => d.accept());
+    await page.goto(url);
+    await page.getByLabel('Your name').fill(who);
+    await page.getByLabel('Passcode').fill('test-passcode');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+    await page.locator('nav button', { hasText: 'Stock' }).click();
+    return page;
+  };
+  const typeCode = async (page, code) => {
+    await page.getByLabel('Barcode number').fill(code);
+    await page.getByRole('button', { name: 'Go', exact: true }).click();
+  };
+  const counted = (n, code) => {
+    const row = backend.tab(`Инвентаризация-${n} итоги`).rows().find((r) => r['Штрихкод'] === code);
+    return row ? row['Насчитано'] : undefined;
+  };
+  const reopen = async (page) => {
+    await page.reload();
+    await page.getByRole('heading', { name: 'Receive a donation' }).waitFor();
+    await page.locator('nav button', { hasText: 'Stock' }).click();
+  };
+  const a = await phone('Sam');
+  const b = await phone('Ana');
+
+  try {
+    await a.getByText('No stock count yet.').waitFor();
+    await a.getByRole('button', { name: 'Start a new count' }).click();
+    await a.getByText('Count 1 started.').waitFor();
+    await a.getByRole('button', { name: 'Count stock' }).click();
+    await a.getByRole('heading', { name: 'Count 1' }).waitFor();
+
+    // Phone A counts two beans and a product that isn't in the sheet.
+    await typeCode(a, BARCODE);
+    await typeCode(a, BARCODE);
+    await a.locator('.row', { hasText: 'Beans' }).getByText('2', { exact: true }).waitFor();
+    await typeCode(a, ARGETA);
+    await a.getByText('Argeta Pašteda kokošja 95 g').waitFor();
+    await a.getByText(`${ARGETA} · not in the sheet, counts as overstock`).waitFor();
+    // The list survives a reload, because it lives on the phone until saved.
+    await reopen(a);
+    await a.getByRole('button', { name: 'Continue counting (3 not saved)' }).click();
+    await a.getByText('Argeta Pašteda kokošja 95 g').waitFor();
+    await a.screenshot({ path: path.join(OUT, '11-stock-count.png'), fullPage: true });
+    const over = await a.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(over <= 0, `count screen scrolls sideways by ${over}px`);
+    await a.getByRole('button', { name: 'Save to the sheet' }).click();
+    await a.getByText('Saved 3 items to count 1.').waitFor();
+    await a.getByText('So far, products missing: 2, overstocked: 1.').waitFor();
+    await a.getByText('Nothing scanned yet.').waitFor();
+    assert.equal(counted(1, BARCODE), 2);
+    assert.equal(backend.tab('Инвентаризация-1 итоги').rows().find((r) => r['Штрихкод'] === ARGETA)['Продукт'], 'Argeta Pašteda kokošja 95 g');
+
+    // Phone B counts the other shelf of beans later, and it adds up.
+    await reopen(b);
+    await b.getByRole('button', { name: 'Count stock' }).click();
+    await typeCode(b, BARCODE);
+    const plus = b.locator('.row', { hasText: 'Beans' }).getByRole('button', { name: 'One more' });
+    for (let i = 0; i < 4; i++) await plus.click();
+    await b.getByText('5 items not saved').waitFor();
+    await b.getByRole('button', { name: 'Save to the sheet' }).click();
+    await b.getByText('Saved 5 items to count 1.').waitFor();
+    assert.equal(counted(1, BARCODE), 7);
+
+    // Undo takes the save back and puts the list back on the phone.
+    await b.getByRole('button', { name: 'Undo' }).click();
+    await b.getByText('Save undone.', { exact: false }).waitFor();
+    await b.getByText('5 items not saved').waitFor();
+    assert.equal(counted(1, BARCODE), 2);
+
+    // A new count starts on phone A. Phone B's list still belongs to count 1.
+    await a.getByRole('button', { name: 'Back' }).click();
+    await a.getByRole('button', { name: 'Start a new count' }).click();
+    await a.getByText('Count 2 started.').waitFor();
+    await reopen(b);
+    await b.getByRole('button', { name: 'Continue counting (5 not saved)' }).click();
+    await b.getByText('This list belongs to count 1, but count 2 has started since.', { exact: false }).waitFor();
+    await b.getByRole('button', { name: 'Save to the sheet' }).click();
+    await b.getByText('Saved 5 items to count 1.').waitFor();
+    assert.equal(counted(1, BARCODE), 7);
+    assert.equal(counted(2, BARCODE), 0);
+    await b.getByRole('heading', { name: 'Count 2' }).waitFor();
+
+    // Counting never changes the stock itself.
+    assert.equal(backend.tab('Остатки').rows().find((r) => r['Штрихкод'] === BARCODE)['В наличии'], 10);
+    assert.deepEqual([...a.errors, ...b.errors], []);
+  } catch (err) {
+    await a.screenshot({ path: path.join(OUT, 'count-failure-a.png'), fullPage: true }).catch(() => {});
+    await b.screenshot({ path: path.join(OUT, 'count-failure-b.png'), fullPage: true }).catch(() => {});
+    throw err;
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});

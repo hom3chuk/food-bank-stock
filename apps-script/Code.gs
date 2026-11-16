@@ -115,6 +115,48 @@ const MAX_PEOPLE_CHANGE = 1000;
 const RECENT_MONEY_ROWS = 30;
 const RSD_NAMES = ['rsd', 'рсд', 'din', 'дин', 'динар', 'динара', 'динаров', 'dinar', 'dinara'];
 
+/*
+ * Stock counts. Each count is a pair of tabs: Инвентаризация-N, where every saved scan is a row,
+ * and Инвентаризация-N итоги, rebuilt from it. The start time sits in the count tab's header row,
+ * to the right of the columns, so it can be corrected by hand.
+ *
+ * Work goes on during a count, so what a shelf should hold depends on when it was counted.
+ * For each product, the expected number is what was available at the start, plus the Журнал
+ * movements of available stock from the start until that product's last scan. A product that was
+ * never scanned uses the count's last scan. Movements after that happened once the shelf was
+ * already counted, so they are left out. Packets aren't counted, and packing, unpacking and
+ * handing out only matter here as far as they change what's available.
+ */
+const COUNT_PREFIX = 'Инвентаризация-';
+const RESULTS_SUFFIX = ' итоги';
+const COUNT_TAB = /^Инвентаризация-(\d+)$/;
+const RESULTS_TAB = /^Инвентаризация-(\d+) итоги$/;
+const COUNT_COLUMNS = [
+  ['Время подсчёта', 'scanned', TEXT], ['Штрихкод', 'barcode', TEXT], ['Продукт', 'name', TEXT],
+  ['Кол-во', 'qty', NUM], ['Волонтёр', 'volunteer', TEXT], ['Время записи', 'timestamp', TEXT],
+  ['ID операции', 'op', TEXT],
+];
+const RESULTS_COLUMNS = [
+  ['Штрихкод', 'barcode', TEXT], ['Продукт', 'name', TEXT], ['Итог', 'verdict', TEXT],
+  ['Разница', 'diff', NUM], ['Насчитано', 'counted', NUM], ['Ожидалось', 'expected', NUM],
+  ['Было на начало', 'before', NUM], ['Изменения после начала', 'during', NUM],
+];
+const VERDICT = { MISSING: 'Не хватает', OVER: 'Излишек', OK: 'Сходится' };
+// Info cells go one empty column to the right of the table, so they never mix with its rows.
+const COUNT_START_CELL = COUNT_COLUMNS.length + 2;
+const RESULTS_INFO_CELL = RESULTS_COLUMNS.length + 2;
+const COUNT_START_LABEL = 'Начало';
+const MAX_COUNT_LINES = 500;
+const TIME_FIELDS = ['timestamp', 'scanned'];
+const TIME_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
+
+function columnsFor_(tab) {
+  if (COLUMNS[tab]) return COLUMNS[tab];
+  if (COUNT_TAB.test(tab)) return COUNT_COLUMNS;
+  if (RESULTS_TAB.test(tab)) return RESULTS_COLUMNS;
+  throw new Error('No columns for tab ' + tab);
+}
+
 /* ---------- Web API ---------- */
 
 function doGet() {
@@ -155,7 +197,10 @@ function checkPasscode_(given) {
 }
 
 function dispatch_(req) {
-  const writes = { receive: receive_, pack: pack_, editPacket: editPacket_, handout: handout_, unpack: unpack_, undo: undo_, money: money_, people: people_, adjust: adjust_ };
+  const writes = {
+    receive: receive_, pack: pack_, editPacket: editPacket_, handout: handout_, unpack: unpack_, undo: undo_,
+    money: money_, people: people_, adjust: adjust_, countStart: countStart_, countSave: countSave_,
+  };
   if (req.action === 'bootstrap') return { ok: true, state: state_(load_()) };
   const handler = writes[req.action];
   if (!handler) throw new ApiError('BAD_REQUEST', 'generic');
@@ -177,9 +222,11 @@ function dispatch_(req) {
     if (ledgerHasOp_(db, op)) return { ok: true, replayed: true, opId: op, result: { action: 'LEDGER' }, state: state_(db) };
 
     const result = handler(req, db, { op: op, volunteer: cleanText_(req.volunteer, 60) || UNKNOWN_VOLUNTEER, now: now_() });
-    // Counting a person should be quick, and it can't change the stock tabs.
+    // Counting a person should be quick, and it can't change the stock tabs. Nor can a stock
+    // count, which rebuilds its own results.
+    const stockCount = req.action === 'countStart' || req.action === 'countSave' || (req.action === 'undo' && isCountUndo_(req));
     if (req.action === 'money' || req.action === 'people') rebuildLedgerViews_(db);
-    else rebuildViews_(db);
+    else if (!stockCount) rebuildViews_(db);
     return { ok: true, opId: op, result: result, state: state_(db) };
   } finally {
     lock.releaseLock();
@@ -424,6 +471,7 @@ function entryDate_(value, ctx) {
 }
 
 function undo_(req, db, ctx) {
+  if (isCountUndo_(req)) return undoCount_(req, db, ctx);
   const target = String(req.targetOp || '');
   const moneyRows = db.money.entries.filter(function (r) { return r.op === target; });
   if (moneyRows.length && target.indexOf(':undo') === -1) return undoMoney_(db, ctx, target, moneyRows);
@@ -477,6 +525,222 @@ function undo_(req, db, ctx) {
     updatePacket_(p, to);
   });
   return { action: 'UNDO', numbers: numbers };
+}
+
+/* ---------- Stock counts ---------- */
+
+/**
+ * Starts the next count. `after` is the newest count the phone knew of, so two volunteers
+ * pressing Start at once get one new count, not two.
+ */
+function countStart_(req, db, ctx) {
+  const latest = latestCount_();
+  if (Number(req.after || 0) !== latest) return { action: 'COUNT_START', number: latest, already: true };
+  const number = latest + 1;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ensureTab_(ss, countName_(number));
+  sheet.getRange(1, COUNT_START_CELL, 1, 2).setNumberFormat(TEXT).setValues([[COUNT_START_LABEL, ctx.now.timestamp]]);
+  ensureTab_(ss, countName_(number) + RESULTS_SUFFIX);
+  const summary = rebuildCountResults_(db, number);
+  return { action: 'COUNT_START', number: number, summary: summary };
+}
+
+/** Adds one phone's list to a count. The same product saved again later simply adds up. */
+function countSave_(req, db, ctx) {
+  const number = requireCount_(req.number);
+  const name = countName_(number);
+  if (readCount_(number).entries.some(function (e) { return e.op === ctx.op; })) {
+    return { action: 'COUNT_SAVE', number: number, replayed: true, summary: rebuildCountResults_(db, number) };
+  }
+  const list = Array.isArray(req.items) ? req.items : [];
+  if (!list.length || list.length > MAX_COUNT_LINES) throw new ApiError('BAD_REQUEST', 'generic');
+  const started = countStarted_(number);
+  const merged = {};
+  const order = [];
+  list.forEach(function (item) {
+    const code = normBarcode_(item.barcode);
+    const known = findProduct_(db, code);
+    if (!merged[code]) {
+      // A barcode not in the sheet keeps the name the phone suggested, so the results can show it.
+      merged[code] = { barcode: code, name: known ? known.name : cleanText_(item.name, 120), qty: 0, scanned: '' };
+      order.push(code);
+    }
+    merged[code].qty += cleanQty_(item.qty);
+    const at = scanTime_(item.at, started, ctx);
+    if (at > merged[code].scanned) merged[code].scanned = at;
+  });
+  appendRows_(name, order.map(function (code) {
+    return Object.assign({}, merged[code], { volunteer: ctx.volunteer, timestamp: ctx.now.timestamp, op: ctx.op });
+  }));
+  const units = order.reduce(function (sum, code) { return sum + merged[code].qty; }, 0);
+  return { action: 'COUNT_SAVE', number: number, units: units, summary: rebuildCountResults_(db, number) };
+}
+
+function isCountUndo_(req) {
+  return req.count !== undefined && req.count !== null && req.count !== '';
+}
+
+/** Takes back one saved list. The rows keep their scan times, so the results come out as before. */
+function undoCount_(req, db, ctx) {
+  const number = requireCount_(req.count);
+  const target = String(req.targetOp || '');
+  const entries = readCount_(number).entries;
+  const rows = entries.filter(function (e) { return e.op === target; });
+  if (!target || !rows.length || target.indexOf(':undo') !== -1) throw new ApiError('NOT_FOUND', 'undoNotFound');
+  const undoOp = target + ':undo';
+  if (entries.some(function (e) { return e.op === undoOp; })) return { action: 'UNDO', alreadyUndone: true };
+  appendRows_(countName_(number), rows.map(function (r) {
+    return { scanned: r.scanned, barcode: r.barcode, name: r.name, qty: -r.qty, volunteer: ctx.volunteer, timestamp: ctx.now.timestamp, op: undoOp };
+  }));
+  return { action: 'UNDO', number: number, summary: rebuildCountResults_(db, number) };
+}
+
+function countName_(number) {
+  return COUNT_PREFIX + number;
+}
+
+function countNumbers_() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheets()
+    .map(function (s) { const match = COUNT_TAB.exec(s.getName()); return match ? Number(match[1]) : 0; })
+    .filter(Boolean)
+    .sort(function (a, b) { return a - b; });
+}
+
+function latestCount_() {
+  const numbers = countNumbers_();
+  return numbers.length ? numbers[numbers.length - 1] : 0;
+}
+
+function requireCount_(value) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || !SpreadsheetApp.getActiveSpreadsheet().getSheetByName(countName_(number))) {
+    throw new ApiError('NOT_FOUND', 'countMissing', { n: value });
+  }
+  return number;
+}
+
+/** The start time from the count tab's header row, as yyyy-MM-dd HH:mm, or '' if it can't be read. */
+function countStarted_(number) {
+  const value = sheet_(countName_(number)).getRange(1, COUNT_START_CELL + 1, 1, 1).getValues()[0][0];
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const text = value instanceof Date ? Utilities.formatDate(value, tz, 'yyyy-MM-dd HH:mm') : String(value).trim();
+  return TIME_PATTERN.test(text) ? text.slice(0, 16) : '';
+}
+
+/** When the phone saw the item, kept between the count's start and now, in case its clock is off. */
+function scanTime_(at, started, ctx) {
+  const ms = Number(at);
+  let time = ctx.now.timestamp;
+  if (Number.isFinite(ms) && ms > 0) {
+    time = Utilities.formatDate(new Date(ms), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm');
+  }
+  if (time > ctx.now.timestamp) time = ctx.now.timestamp;
+  if (started && time < started) time = started;
+  return time;
+}
+
+/** Rows typed or pasted by hand are read too. Ones that can't be read are reported in the results. */
+function readCount_(number) {
+  const out = { entries: [], badRows: [] };
+  readTable_(countName_(number)).forEach(function (r) {
+    if (!r.barcode && r.qty === '') return;
+    const qty = parseAmount_(r.qty);
+    let code = '';
+    try { code = normBarcode_(r.barcode); } catch (err) { code = ''; }
+    if (!code || !Number.isInteger(qty)) {
+      out.badRows.push(r.row);
+      return;
+    }
+    const scanned = TIME_PATTERN.test(r.scanned) ? r.scanned.slice(0, 16) : TIME_PATTERN.test(r.timestamp) ? r.timestamp.slice(0, 16) : '';
+    out.entries.push({ row: r.row, barcode: code, name: r.name, qty: qty, scanned: scanned, op: r.op });
+  });
+  return out;
+}
+
+/** How one Журнал row changes what's on the open shelves. */
+function availableChange_(r) {
+  const q = Number(r.qty) || 0;
+  if (r.action === ACTION.RECEIVED || r.action === ACTION.UNPACKED) return q;
+  if (r.action === ACTION.PACKED) return -q;
+  if (r.action === ACTION.GIVEN_OUT && !r.packet) return -q;
+  return 0;
+}
+
+/** Rebuilds a count's results tab and returns how many products are missing or overstocked. */
+function rebuildCountResults_(db, number) {
+  const started = countStarted_(number);
+  const count = readCount_(number);
+  const counted = {};
+  const lastScan = {};
+  const countNames = {};
+  let countEnd = started;
+  count.entries.forEach(function (e) {
+    counted[e.barcode] = (counted[e.barcode] || 0) + e.qty;
+    if (e.name) countNames[e.barcode] = e.name;
+    const at = e.scanned || started;
+    if (!lastScan[e.barcode] || at > lastScan[e.barcode]) lastScan[e.barcode] = at;
+    if (at > countEnd) countEnd = at;
+  });
+
+  const before = {};
+  const during = {};
+  const logNames = {};
+  db.log.forEach(function (r) {
+    if (!r.barcode) return;
+    logNames[r.barcode] = r.name;
+    const change = availableChange_(r);
+    if (!change) return;
+    // A row typed into Журнал by hand may have no time. It counts from the start of its date.
+    const at = TIME_PATTERN.test(r.timestamp) ? r.timestamp.slice(0, 16) : r.date ? r.date + ' 00:00' : '';
+    if (at < started) before[r.barcode] = (before[r.barcode] || 0) + change;
+    else if (at <= (lastScan[r.barcode] || countEnd)) during[r.barcode] = (during[r.barcode] || 0) + change;
+  });
+
+  const productNames = {};
+  db.products.forEach(function (p) { productNames[p.barcode] = p.name; });
+  const codes = {};
+  [before, during, counted].forEach(function (m) { Object.keys(m).forEach(function (c) { codes[c] = true; }); });
+  const rows = Object.keys(codes).map(function (code) {
+    const expected = (before[code] || 0) + (during[code] || 0);
+    const got = counted[code] || 0;
+    const diff = got - expected;
+    return {
+      barcode: code, name: productNames[code] || countNames[code] || logNames[code] || '',
+      verdict: diff < 0 ? VERDICT.MISSING : diff > 0 ? VERDICT.OVER : VERDICT.OK,
+      diff: diff, counted: got, expected: expected, before: before[code] || 0, during: during[code] || 0,
+    };
+  }).filter(function (r) { return r.expected || r.counted; });
+
+  // Biggest problems first: shortages, then overstock, then what matched.
+  const rank = {};
+  rank[VERDICT.MISSING] = 0; rank[VERDICT.OVER] = 1; rank[VERDICT.OK] = 2;
+  rows.sort(function (a, b) {
+    return rank[a.verdict] - rank[b.verdict] || Math.abs(b.diff) - Math.abs(a.diff) || String(a.name).localeCompare(String(b.name), SORT_LOCALE);
+  });
+
+  const summary = {
+    missing: rows.filter(function (r) { return r.verdict === VERDICT.MISSING; }).length,
+    over: rows.filter(function (r) { return r.verdict === VERDICT.OVER; }).length,
+  };
+  const resultsName = countName_(number) + RESULTS_SUFFIX;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(resultsName) || ensureTab_(ss, resultsName);
+  replaceTable_(resultsName, rows);
+  sheet.getRange(1, RESULTS_INFO_CELL, 5, 2).setNumberFormat(TEXT).setValues([
+    ['Начало', started || 'не читается: проверьте ячейку «' + COUNT_START_LABEL + '» во вкладке ' + countName_(number)],
+    ['Последний подсчёт', countEnd],
+    ['Не хватает, позиций', String(summary.missing)],
+    ['Излишек, позиций', String(summary.over)],
+    ['Нечитаемые строки', count.badRows.join(', ')],
+  ]);
+  return summary;
+}
+
+function latestCountState_() {
+  const number = latestCount_();
+  if (!number) return null;
+  const results = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(countName_(number) + RESULTS_SUFFIX);
+  return { number: number, started: countStarted_(number), resultsGid: results ? results.getSheetId() : null };
 }
 
 /* ---------- Domain helpers ---------- */
@@ -759,7 +1023,7 @@ function now_() {
 
 function readTable_(tab) {
   const sheet = sheet_(tab);
-  const cols = COLUMNS[tab];
+  const cols = columnsFor_(tab);
   const last = sheet.getLastRow();
   if (last < 2) return [];
   const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
@@ -767,7 +1031,8 @@ function readTable_(tab) {
     const row = { row: i + 2 };
     cols.forEach(function (col, c) {
       const v = values[c];
-      if (v instanceof Date) row[col[1]] = Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+      // A time typed by hand can turn into a real date. Times are compared as text, so keep the minutes.
+      if (v instanceof Date) row[col[1]] = Utilities.formatDate(v, tz, TIME_FIELDS.indexOf(col[1]) !== -1 ? 'yyyy-MM-dd HH:mm' : 'yyyy-MM-dd');
       else row[col[1]] = col[2] === TEXT ? String(v).trim() : v;
     });
     return row;
@@ -788,12 +1053,12 @@ function load_() {
 
 function toValues_(tab, objects) {
   return objects.map(function (o) {
-    return COLUMNS[tab].map(function (col) { return o[col[1]] === undefined || o[col[1]] === null ? '' : o[col[1]]; });
+    return columnsFor_(tab).map(function (col) { return o[col[1]] === undefined || o[col[1]] === null ? '' : o[col[1]]; });
   });
 }
 
 function formatsFor_(tab, count) {
-  const formats = COLUMNS[tab].map(function (col) { return col[2]; });
+  const formats = columnsFor_(tab).map(function (col) { return col[2]; });
   const out = [];
   for (let i = 0; i < count; i++) out.push(formats);
   return out;
@@ -805,7 +1070,7 @@ function appendRows_(tab, objects) {
   const start = sheet.getLastRow() + 1;
   const needed = start + objects.length - 1 - sheet.getMaxRows();
   if (needed > 0) sheet.insertRowsAfter(sheet.getMaxRows(), needed);
-  const range = sheet.getRange(start, 1, objects.length, COLUMNS[tab].length);
+  const range = sheet.getRange(start, 1, objects.length, columnsFor_(tab).length);
   range.setNumberFormats(formatsFor_(tab, objects.length)); // Keeps leading zeros and text dates intact.
   range.setValues(toValues_(tab, objects));
   return start;
@@ -813,7 +1078,7 @@ function appendRows_(tab, objects) {
 
 function replaceTable_(tab, objects) {
   const sheet = sheet_(tab);
-  const width = COLUMNS[tab].length;
+  const width = columnsFor_(tab).length;
   const last = sheet.getLastRow();
   if (last > 1) sheet.getRange(2, 1, last - 1, width).clearContent();
   if (objects.length) appendRows_(tab, objects);
@@ -959,6 +1224,7 @@ function state_(db) {
   return {
     sheetUrl: SpreadsheetApp.getActiveSpreadsheet().getUrl(),
     today: now_().date,
+    count: latestCountState_(),
     money: moneyState_(db.money),
     people: peopleState_(db.people),
     products: db.products.map(function (p) {
@@ -994,14 +1260,28 @@ function onOpen() {
 /** Keeps the Stock and Daily tabs right when someone corrects the Log or Products tab by hand. */
 function onEdit(e) {
   const tab = e && e.range && e.range.getSheet().getName();
-  if (tab === TABS.LOG || tab === TABS.PRODUCTS) rebuildViews_(load_());
+  const count = COUNT_TAB.exec(tab || '');
+  if (tab === TABS.LOG || tab === TABS.PRODUCTS) {
+    const db = load_();
+    rebuildViews_(db);
+    rebuildLatestCount_(db);
+  }
   // Pasting old data counts as an edit, so the daily tabs update straight away.
   if (tab === TABS.MONEY || tab === TABS.PEOPLE) rebuildLedgerViews_(load_());
+  if (count) rebuildCountResults_(load_(), Number(count[1]));
 }
 
 function rebuildNow() {
-  rebuildViews_(load_());
+  const db = load_();
+  rebuildViews_(db);
+  rebuildLatestCount_(db);
   SpreadsheetApp.getActiveSpreadsheet().toast('Остатки и отчёты по дням обновлены.');
+}
+
+/** A fix in Журнал can change what the latest count expected. Older counts are left as they were. */
+function rebuildLatestCount_(db) {
+  const number = latestCount_();
+  if (number) rebuildCountResults_(db, number);
 }
 
 function setupSheet() {
@@ -1019,7 +1299,7 @@ function setupSheet() {
 }
 
 function ensureTab_(ss, tab) {
-  const cols = COLUMNS[tab];
+  const cols = columnsFor_(tab);
   const sheet = ss.getSheetByName(tab) || ss.insertSheet(tab);
   const header = sheet.getRange(1, 1, 1, cols.length);
   header.setValues([cols.map(function (c) { return c[0]; })]);

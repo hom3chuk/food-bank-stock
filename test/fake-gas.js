@@ -55,9 +55,12 @@ class FakeRange {
   getSheet() { return this.sheet; }
 }
 
+let nextSheetId = 1;
+
 class FakeSheet {
   constructor(name) {
     this.name = name;
+    this.id = nextSheetId++;
     this.maxRows = 1000;
     this.cells = new Map();
   }
@@ -67,6 +70,7 @@ class FakeSheet {
     return this.cells.get(key);
   }
   getName() { return this.name; }
+  getSheetId() { return this.id; }
   getMaxRows() { return this.maxRows; }
   getLastRow() {
     let last = 0;

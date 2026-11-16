@@ -290,7 +290,8 @@ async function refreshInBackground() {
 /* Background refreshes should only redraw the screens that have no half-filled form. */
 function renderKeepingInputs() {
   const receiving = app.tab === 'receive' && app.view.receive;
-  if (app.tab === 'pack' || receiving || app.view.edit) return;
+  const counting = app.tab === 'stock' && app.view.count;
+  if (app.tab === 'pack' || receiving || counting || app.view.edit) return;
   if (scanner.isOn() || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
   render();
 }
@@ -308,22 +309,32 @@ function showNotice(kind, text, undoOp) {
 
 function noticeEl() {
   if (!app.notice) return '';
-  const { kind, text, undoOp } = app.notice;
+  const notice = app.notice;
+  const { kind, text, undoOp } = notice;
   return h(`div.notice.${kind}`, { role: kind === 'bad' ? 'alert' : 'status' },
     h('span', null, text()),
-    undoOp ? h('button', { onclick: () => undo(undoOp) }, t('common.undo')) : null);
+    undoOp ? h('button', { onclick: () => undo(notice) }, t('common.undo')) : null);
 }
 
-async function undo(targetOp) {
+/** `undoCount` marks a saved stock count list. `onUndone` can return the key of its own message. */
+async function undo({ undoOp, undoCount, onUndone }) {
   const opId = newOpId();
-  const reply = await request('undo', { opId, targetOp });
+  const reply = await request('undo', { opId, targetOp: undoOp, count: undoCount });
   if (!reply) return;
   if (app.tab === 'receive') app.view.receive = null;
-  app.notice = { kind: 'good', text: say(app.tab === 'money' ? 'money.undone' : 'common.undone') };
+  const own = onUndone && !reply.result.alreadyUndone ? onUndone() : '';
+  app.notice = { kind: 'good', text: say(own || (app.tab === 'money' ? 'money.undone' : 'common.undone')) };
   render();
 }
 
 /* ---------- Barcode scanner ---------- */
+
+// The scanner library starts its video without waiting for it. If the camera is stopped straight
+// away, the browser cancels that start and reports an error that nothing can act on.
+window.addEventListener('unhandledrejection', (event) => {
+  const err = event.reason;
+  if (err && err.name === 'AbortError' && /play\(\)/.test(String(err.message))) event.preventDefault();
+});
 
 const scanner = (() => {
   let instance = null;
@@ -1309,6 +1320,7 @@ function editScreen() {
 /* ---------- Stock ---------- */
 
 function stockScreen() {
+  if (app.view.count) return countScreen();
   const products = app.data.products;
   const totals = products.reduce((t, p) => ({
     available: t.available + p.available, packed: t.packed + p.packed, given: t.given + p.given,
@@ -1319,6 +1331,7 @@ function stockScreen() {
       h('h2', null, t('stock.title')),
       countsEl(totals),
       app.data.sheetUrl ? h('a.btn', { href: app.data.sheetUrl, target: '_blank', rel: 'noopener' }, t('stock.openSheet')) : null),
+    countCard(),
     h('div.card', null,
       searchList({
         placeholder: t('common.searchProducts'),
@@ -1359,6 +1372,203 @@ function openAdjust(p) {
   dialog.addEventListener('close', () => dialog.remove());
   document.body.append(dialog);
   dialog.showModal();
+}
+
+/* ---------- Stock count ---------- */
+
+/* The list stays on the phone until the volunteer saves it, so a locked screen or a reload loses nothing. */
+function countDraft() {
+  if (!app.view.countDraft) {
+    let saved = null;
+    try { saved = JSON.parse(store.get('fb_count')); } catch { /* No list saved. */ }
+    app.view.countDraft = saved && Array.isArray(saved.items) && saved.number
+      ? saved
+      : { number: null, items: [], opId: newOpId() };
+  }
+  const draft = app.view.countDraft;
+  // An empty list always belongs to the newest count. One with scans keeps the count it was started in.
+  const current = app.data.count;
+  if (!draft.items.length) draft.number = current ? current.number : null;
+  return draft;
+}
+
+function saveCountDraft(draft, changed) {
+  if (changed) draft.opId = newOpId();
+  if (draft.items.length) store.set('fb_count', JSON.stringify(draft));
+  else store.remove('fb_count');
+}
+
+function countUnits(draft) {
+  return draft.items.reduce((sum, i) => sum + i.qty, 0);
+}
+
+/** 2026-11-16 10:00 as 16.11.2026 10:00. */
+function formatTime(stamp) {
+  const [date, time] = String(stamp).split(' ');
+  return time ? `${formatDate(date)} ${time}` : formatDate(date);
+}
+
+function countResultsUrl(count) {
+  if (!app.data.sheetUrl || !count || count.resultsGid === null || count.resultsGid === undefined) return '';
+  return `${app.data.sheetUrl}#gid=${count.resultsGid}`;
+}
+
+function countCard() {
+  const current = app.data.count;
+  const draft = countDraft();
+  const units = countUnits(draft);
+  const link = countResultsUrl(current);
+  return h('div.card', null,
+    h('h2', null, t('stock.countTitle')),
+    current
+      ? h('p', null, h('b', null, t('inv.name', { n: current.number })), h('br'), h('span.muted', null, t('inv.startedAt', { time: formatTime(current.started) })))
+      : h('p.muted', null, t('inv.none')),
+    current || units
+      ? h('button.btn.primary', { type: 'button', onclick: () => { app.view.count = true; app.notice = null; render(); } },
+        units ? t('inv.continue', { n: units }) : t('inv.open'))
+      : null,
+    link ? h('a.btn', { href: link, target: '_blank', rel: 'noopener' }, t('inv.results')) : null,
+    h('button.btn', { type: 'button', onclick: () => startCount(current) }, t('inv.start')));
+}
+
+async function startCount(current) {
+  const next = current ? current.number + 1 : 1;
+  if (!window.confirm(t('inv.startConfirm', { n: next }))) return;
+  const reply = await request('countStart', { opId: newOpId(), after: current ? current.number : 0 });
+  if (!reply) return;
+  const { number, already } = reply.result;
+  app.notice = { kind: already ? 'warn' : 'good', text: say(already ? 'inv.already' : 'inv.started', { n: number }) };
+  render();
+}
+
+function countScreen() {
+  const draft = countDraft();
+  const current = app.data.count;
+  if (!draft.number) {
+    app.view.count = false;
+    return stockScreen();
+  }
+
+  const listEl = h('div.list');
+  const emptyNote = h('p.muted', null, t('inv.empty'));
+  const save = h('button.btn.primary', { type: 'button', onclick: () => saveCount() }, t('inv.save'));
+  const clear = h('button.btn', {
+    type: 'button',
+    onclick: () => {
+      if (!window.confirm(t('inv.clearConfirm'))) return;
+      draft.items = [];
+      saveCountDraft(draft, true);
+      app.notice = null;
+      render();
+    },
+  }, t('inv.clear'));
+  const barText = h('span');
+  const listCard = h('div.card', null, h('h3', null, t('inv.listTitle')), emptyNote, listEl, save, clear);
+  const bar = h('div.basket-bar', null, barText,
+    h('button', { type: 'button', onclick: () => listCard.scrollIntoView({ block: 'start', behavior: 'smooth' }) }, t('inv.review')));
+
+  function draw() {
+    listEl.replaceChildren(...[...draft.items].reverse().map((item) => {
+      const p = product(item.barcode);
+      return h('div.row', null,
+        h('div.row-main', null,
+          h('div.row-title', null, p ? p.name : item.name || item.barcode),
+          p ? h('div.muted.mono', null, item.barcode.startsWith('NB-') ? t('receive.noBarcodeTag') : item.barcode)
+            : h('div.short', null, `${item.barcode} · ${t('inv.notInSheet')}`)),
+        h('div.mini-stepper', null,
+          h('button', { type: 'button', 'aria-label': t('common.oneFewer'), onclick: () => change(item, -1) }, '−'),
+          h('span', null, String(item.qty)),
+          h('button', { type: 'button', 'aria-label': t('common.oneMore'), onclick: () => change(item, 1) }, '+')));
+    }));
+    const units = countUnits(draft);
+    emptyNote.hidden = units > 0;
+    save.disabled = !units;
+    clear.hidden = !units;
+    bar.hidden = !units;
+    barText.textContent = t('inv.bar', { items: t('count.items', { n: units }) });
+  }
+
+  function change(item, by) {
+    item.qty += by;
+    draft.items = draft.items.filter((i) => i.qty > 0);
+    saveCountDraft(draft, true);
+    draw();
+  }
+
+  function addCode(code) {
+    const add = () => {
+      const p = product(code);
+      addScanned(draft.items, code, { name: p ? p.name : '' });
+      const item = draft.items[draft.items.length - 1];
+      // When it was seen, so the sheet can tell it apart from stock that moved later.
+      item.at = Date.now();
+      saveCountDraft(draft, true);
+      draw();
+      confirmAdded(p ? p.name : item.name || code);
+      if (p || item.name || code.startsWith('NB-')) return;
+      lookupName(code).then((name) => {
+        const still = draft.items.find((i) => i.barcode === code);
+        if (!name || !still || still.name) return;
+        still.name = name;
+        saveCountDraft(draft, false);
+        draw();
+      });
+    };
+    // A barcode that isn't in the sheet is still counted: it shows up as overstock.
+    if (product(code) || draft.items.some((i) => i.barcode === code)) add();
+    else resolveProduct(code, add);
+  }
+
+  async function saveCount() {
+    const number = draft.number;
+    const items = draft.items.map((i) => ({ barcode: i.barcode, qty: i.qty, at: i.at, name: product(i.barcode) ? undefined : i.name }));
+    const reply = await request('countSave', { opId: draft.opId, number, items });
+    if (!reply) return;
+    const saved = draft.items.map((i) => ({ ...i }));
+    const units = countUnits(draft);
+    draft.items = [];
+    saveCountDraft(draft, true);
+    const summary = reply.result.summary;
+    app.notice = {
+      kind: 'good',
+      text: () => [
+        t('inv.saved', { items: t('count.items', { n: units }), n: number }),
+        summary ? t('inv.summary', summary) : '',
+      ].filter(Boolean).join(' '),
+      undoOp: reply.opId,
+      undoCount: number,
+      // Undo puts the list back on this phone, so it can be fixed and saved again.
+      onUndone: () => {
+        const list = countDraft();
+        if (list.items.length && list.number !== number) return;
+        list.number = number;
+        saved.forEach((s) => {
+          const there = list.items.find((i) => i.barcode === s.barcode);
+          if (there) there.qty += s.qty;
+          else list.items.unshift(s);
+        });
+        saveCountDraft(list, true);
+        return 'inv.restored';
+      },
+    };
+    render();
+  }
+
+  draw();
+
+  return [
+    h('div.card', null,
+      h('h2', null, t('inv.name', { n: draft.number })),
+      draft.number === (current && current.number)
+        ? h('p.muted', null, t('inv.startedAt', { time: formatTime(current.started) }))
+        : h('div.notice.warn', null, h('span', null, t('inv.oldList', { n: draft.number, m: current ? current.number : '' }))),
+      h('p.muted', null, t('inv.intro')),
+      codeEntry({ continuous: true, onCode: addCode }),
+      h('button.btn', { type: 'button', onclick: () => openPackPicker(addCode) }, t('common.addNoBarcode'))),
+    listCard,
+    h('button.btn', { type: 'button', onclick: () => { app.view.count = false; app.notice = null; render(); } }, t('common.back')),
+    bar,
+  ];
 }
 
 /* ---------- People and money ---------- */
