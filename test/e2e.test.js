@@ -1146,7 +1146,28 @@ test('a stock count adds up lists saved from several phones', { timeout: 120000 
     await b.getByRole('heading', { name: 'Count 2' }).waitFor();
 
     // Counting never changes the stock itself.
-    assert.equal(backend.tab('Остатки').rows().find((r) => r['Штрихкод'] === BARCODE)['В наличии'], 10);
+    const available = (code) => backend.tab('Остатки').rows().find((r) => r['Штрихкод'] === code)['В наличии'];
+    assert.equal(available(BARCODE), 10);
+
+    // Closing the newest count makes stock match it. Count 2 found 4 beans and nothing else.
+    await typeCode(b, BARCODE);
+    for (let i = 0; i < 3; i++) await b.locator('.row', { hasText: 'Beans' }).getByRole('button', { name: 'One more' }).click();
+    await b.getByRole('button', { name: 'Save to the sheet' }).click();
+    await b.getByText('Saved 4 items to count 2.').waitFor();
+    await b.getByRole('button', { name: 'Back' }).click();
+    await b.getByRole('button', { name: 'Close count and fix stock' }).click();
+    await b.getByText('Count 2 closed. Stock now matches it: 0 received, 12 given out.').waitFor();
+    await b.getByText(/^Closed /).waitFor();
+    assert.equal(await b.getByRole('button', { name: 'Count stock' }).count(), 0);
+    await b.screenshot({ path: path.join(OUT, '12-count-closed.png'), fullPage: true });
+    assert.equal(available(BARCODE), 4);
+    assert.equal(available(RICE), 0);
+
+    // Undo puts stock back and reopens the count.
+    await b.getByRole('button', { name: 'Undo' }).click();
+    await b.getByText('Count reopened, and the stock corrections were taken back.').waitFor();
+    assert.equal(available(BARCODE), 10);
+    await b.getByRole('button', { name: 'Close count and fix stock' }).waitFor();
     assert.deepEqual([...a.errors, ...b.errors], []);
   } catch (err) {
     await a.screenshot({ path: path.join(OUT, 'count-failure-a.png'), fullPage: true }).catch(() => {});

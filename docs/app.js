@@ -1421,14 +1421,40 @@ function countCard() {
   return h('div.card', null,
     h('h2', null, t('stock.countTitle')),
     current
-      ? h('p', null, h('b', null, t('inv.name', { n: current.number })), h('br'), h('span.muted', null, t('inv.startedAt', { time: formatTime(current.started) })))
+      ? h('p', null, h('b', null, t('inv.name', { n: current.number })), h('br'),
+        h('span.muted', null, current.closed ? t('inv.closedAt', { time: formatTime(current.closed) }) : t('inv.startedAt', { time: formatTime(current.started) })))
       : h('p.muted', null, t('inv.none')),
-    current || units
+    (current && !current.closed) || units
       ? h('button.btn.primary', { type: 'button', onclick: () => { app.view.count = true; app.notice = null; render(); } },
         units ? t('inv.continue', { n: units }) : t('inv.open'))
       : null,
     link ? h('a.btn', { href: link, target: '_blank', rel: 'noopener' }, t('inv.results')) : null,
+    current && !current.closed ? h('button.btn.danger', { type: 'button', onclick: () => closeCount(current) }, t('inv.close')) : null,
     h('button.btn', { type: 'button', onclick: () => startCount(current) }, t('inv.start')));
+}
+
+async function closeCount(current) {
+  if (!window.confirm(t('inv.closeConfirm', { n: current.number }))) return;
+  // Trying again after a lost connection must not correct stock twice.
+  if (!app.view.closeTry || app.view.closeTry.number !== current.number) app.view.closeTry = { number: current.number, opId: newOpId() };
+  const reply = await request('countClose', { opId: app.view.closeTry.opId, number: current.number });
+  if (!reply) return;
+  app.view.closeTry = null;
+  const r = reply.result;
+  if (r.already) {
+    app.notice = { kind: 'warn', text: say('inv.alreadyClosed', { n: current.number }) };
+  } else {
+    app.notice = {
+      kind: 'good',
+      // A retry that was already saved gets no totals back.
+      text: r.action === 'COUNT_CLOSE'
+        ? say('inv.closed', { n: current.number, received: r.received, given: r.given })
+        : say('inv.closedShort', { n: current.number }),
+      undoOp: reply.opId,
+      onUndone: () => 'inv.reopened',
+    };
+  }
+  render();
 }
 
 async function startCount(current) {
@@ -1560,7 +1586,9 @@ function countScreen() {
     h('div.card', null,
       h('h2', null, t('inv.name', { n: draft.number })),
       draft.number === (current && current.number)
-        ? h('p.muted', null, t('inv.startedAt', { time: formatTime(current.started) }))
+        ? current.closed
+          ? h('div.notice.warn', null, h('span', null, t('inv.closedList', { n: draft.number })))
+          : h('p.muted', null, t('inv.startedAt', { time: formatTime(current.started) }))
         : h('div.notice.warn', null, h('span', null, t('inv.oldList', { n: draft.number, m: current ? current.number : '' }))),
       h('p.muted', null, t('inv.intro')),
       codeEntry({ continuous: true, onCode: addCode }),

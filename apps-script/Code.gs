@@ -146,6 +146,8 @@ const VERDICT = { MISSING: 'Не хватает', OVER: 'Излишек', OK: '�
 const COUNT_START_CELL = COUNT_COLUMNS.length + 2;
 const RESULTS_INFO_CELL = RESULTS_COLUMNS.length + 2;
 const COUNT_START_LABEL = 'Начало';
+// Closing writes these next to the start time: the label, when, and the operation ID for undo.
+const COUNT_CLOSED_LABEL = 'Закрыта';
 const MAX_COUNT_LINES = 500;
 const TIME_FIELDS = ['timestamp', 'scanned'];
 const TIME_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
@@ -199,7 +201,7 @@ function checkPasscode_(given) {
 function dispatch_(req) {
   const writes = {
     receive: receive_, pack: pack_, editPacket: editPacket_, handout: handout_, unpack: unpack_, undo: undo_,
-    money: money_, people: people_, adjust: adjust_, countStart: countStart_, countSave: countSave_,
+    money: money_, people: people_, adjust: adjust_, countStart: countStart_, countSave: countSave_, countClose: countClose_,
   };
   if (req.action === 'bootstrap') return { ok: true, state: state_(load_()) };
   const handler = writes[req.action];
@@ -472,6 +474,8 @@ function entryDate_(value, ctx) {
 
 function undo_(req, db, ctx) {
   if (isCountUndo_(req)) return undoCount_(req, db, ctx);
+  const closed = countClosedBy_(String(req.targetOp || ''));
+  if (closed) return undoCountClose_(db, ctx, closed, String(req.targetOp));
   const target = String(req.targetOp || '');
   const moneyRows = db.money.entries.filter(function (r) { return r.op === target; });
   if (moneyRows.length && target.indexOf(':undo') === -1) return undoMoney_(db, ctx, target, moneyRows);
@@ -542,7 +546,7 @@ function countStart_(req, db, ctx) {
   sheet.getRange(1, COUNT_START_CELL, 1, 2).setNumberFormat(TEXT).setValues([[COUNT_START_LABEL, ctx.now.timestamp]]);
   ensureTab_(ss, countName_(number) + RESULTS_SUFFIX);
   const summary = rebuildCountResults_(db, number);
-  return { action: 'COUNT_START', number: number, summary: summary };
+  return { action: 'COUNT_START', number: number, summary: brief_(summary) };
 }
 
 /** Adds one phone's list to a count. The same product saved again later simply adds up. */
@@ -550,8 +554,9 @@ function countSave_(req, db, ctx) {
   const number = requireCount_(req.number);
   const name = countName_(number);
   if (readCount_(number).entries.some(function (e) { return e.op === ctx.op; })) {
-    return { action: 'COUNT_SAVE', number: number, replayed: true, summary: rebuildCountResults_(db, number) };
+    return { action: 'COUNT_SAVE', number: number, replayed: true, summary: brief_(rebuildCountResults_(db, number)) };
   }
+  requireOpen_(number);
   const list = Array.isArray(req.items) ? req.items : [];
   if (!list.length || list.length > MAX_COUNT_LINES) throw new ApiError('BAD_REQUEST', 'generic');
   const started = countStarted_(number);
@@ -573,7 +578,7 @@ function countSave_(req, db, ctx) {
     return Object.assign({}, merged[code], { volunteer: ctx.volunteer, timestamp: ctx.now.timestamp, op: ctx.op });
   }));
   const units = order.reduce(function (sum, code) { return sum + merged[code].qty; }, 0);
-  return { action: 'COUNT_SAVE', number: number, units: units, summary: rebuildCountResults_(db, number) };
+  return { action: 'COUNT_SAVE', number: number, units: units, summary: brief_(rebuildCountResults_(db, number)) };
 }
 
 function isCountUndo_(req) {
@@ -589,10 +594,11 @@ function undoCount_(req, db, ctx) {
   if (!target || !rows.length || target.indexOf(':undo') !== -1) throw new ApiError('NOT_FOUND', 'undoNotFound');
   const undoOp = target + ':undo';
   if (entries.some(function (e) { return e.op === undoOp; })) return { action: 'UNDO', alreadyUndone: true };
+  requireOpen_(number);
   appendRows_(countName_(number), rows.map(function (r) {
     return { scanned: r.scanned, barcode: r.barcode, name: r.name, qty: -r.qty, volunteer: ctx.volunteer, timestamp: ctx.now.timestamp, op: undoOp };
   }));
-  return { action: 'UNDO', number: number, summary: rebuildCountResults_(db, number) };
+  return { action: 'UNDO', number: number, summary: brief_(rebuildCountResults_(db, number)) };
 }
 
 function countName_(number) {
@@ -621,10 +627,84 @@ function requireCount_(value) {
 
 /** The start time from the count tab's header row, as yyyy-MM-dd HH:mm, or '' if it can't be read. */
 function countStarted_(number) {
-  const value = sheet_(countName_(number)).getRange(1, COUNT_START_CELL + 1, 1, 1).getValues()[0][0];
+  return countInfo_(number).started;
+}
+
+/** What the count tab's header row says: when it started, and when it was closed and by which operation. */
+function countInfo_(number) {
+  const values = sheet_(countName_(number)).getRange(1, COUNT_START_CELL, 1, 5).getValues()[0];
   const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-  const text = value instanceof Date ? Utilities.formatDate(value, tz, 'yyyy-MM-dd HH:mm') : String(value).trim();
-  return TIME_PATTERN.test(text) ? text.slice(0, 16) : '';
+  const time = function (value) {
+    const text = value instanceof Date ? Utilities.formatDate(value, tz, 'yyyy-MM-dd HH:mm') : String(value).trim();
+    return TIME_PATTERN.test(text) ? text.slice(0, 16) : '';
+  };
+  const closed = String(values[2]).trim() === COUNT_CLOSED_LABEL ? time(values[3]) || 'closed' : '';
+  return { started: time(values[1]), closed: closed, closeOp: closed ? String(values[4]).trim() : '' };
+}
+
+function requireOpen_(number) {
+  if (countInfo_(number).closed) throw new ApiError('CONFLICT', 'countClosed', { n: number });
+}
+
+/**
+ * Closes the newest count and makes stock match it. Overstock goes into Журнал as received and
+ * shortages as given out, now, marked with the count's name. Each product moves by the difference
+ * the count found, not to the counted number, because anything that moved after its shelf was
+ * counted really happened and still counts.
+ */
+function countClose_(req, db, ctx) {
+  const number = requireCount_(req.number);
+  if (countInfo_(number).closed) return { action: 'COUNT_CLOSE', number: number, already: true };
+  if (number !== latestCount_()) throw new ApiError('CONFLICT', 'countNotLatest', { n: number });
+
+  const results = rebuildCountResults_(db, number);
+  const note = countName_(number);
+  const rows = [];
+  results.rows.forEach(function (r) {
+    if (!r.diff) return;
+    if (!findProduct_(db, r.barcode)) {
+      // Found on the shelf but never received. Stock needs a product to belong to.
+      const product = { barcode: r.barcode, name: r.name || r.barcode, category: '', description: 'Найдено при инвентаризации: ' + note, firstSeen: ctx.now.date };
+      db.products.push(product);
+      appendRows_(TABS.PRODUCTS, [product]);
+    }
+    const name = findProduct_(db, r.barcode).name;
+    rows.push(r.diff > 0
+      ? { action: ACTION.RECEIVED, barcode: r.barcode, name: name, qty: r.diff, note: note }
+      : { action: ACTION.GIVEN_OUT, barcode: r.barcode, name: name, qty: -r.diff, note: note });
+  });
+  if (rows.length) addLog_(db, ctx, rows);
+  markClosed_(number, [COUNT_CLOSED_LABEL, ctx.now.timestamp, ctx.op]);
+  const sum = function (action) {
+    return rows.filter(function (r) { return r.action === action; }).reduce(function (n, r) { return n + r.qty; }, 0);
+  };
+  return { action: 'COUNT_CLOSE', number: number, products: rows.length, received: sum(ACTION.RECEIVED), given: sum(ACTION.GIVEN_OUT) };
+}
+
+function markClosed_(number, values) {
+  sheet_(countName_(number)).getRange(1, COUNT_START_CELL + 2, 1, 3).setNumberFormat(TEXT).setValues([values]);
+  const results = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(countName_(number) + RESULTS_SUFFIX);
+  if (results) results.getRange(6, RESULTS_INFO_CELL, 1, 2).setNumberFormat(TEXT).setValues([[values[0] ? COUNT_CLOSED_LABEL : '', values[1]]]);
+}
+
+/** The newest count, if `op` is what closed it. Only the newest can be closed, so only it can be reopened. */
+function countClosedBy_(op) {
+  const number = latestCount_();
+  return op && number && countInfo_(number).closeOp === op ? number : 0;
+}
+
+/** Takes the stock corrections back out and opens the count again, so more can be scanned. */
+function undoCountClose_(db, ctx, number, target) {
+  const undoOp = target + ':undo';
+  const rows = db.log.filter(function (r) { return r.op === target; });
+  if (rows.length && !db.log.some(function (r) { return r.op === undoOp; })) {
+    addLog_(db, Object.assign({}, ctx, { op: undoOp }), rows.map(function (r) {
+      return { action: r.action, barcode: r.barcode, name: r.name, qty: -Number(r.qty), note: UNDO_NOTE };
+    }));
+  }
+  markClosed_(number, ['', '', '']);
+  rebuildCountResults_(db, number);
+  return { action: 'UNDO', number: number };
 }
 
 /** When the phone saw the item, kept between the count's start and now, in case its clock is off. */
@@ -668,7 +748,10 @@ function availableChange_(r) {
 
 /** Rebuilds a count's results tab and returns how many products are missing or overstocked. */
 function rebuildCountResults_(db, number) {
-  const started = countStarted_(number);
+  // A closed count has already changed stock. Its results stay as they were when it closed.
+  const info = countInfo_(number);
+  if (info.closed) return null;
+  const started = info.started;
   const count = readCount_(number);
   const counted = {};
   const lastScan = {};
@@ -733,14 +816,20 @@ function rebuildCountResults_(db, number) {
     ['Излишек, позиций', String(summary.over)],
     ['Нечитаемые строки', count.badRows.join(', ')],
   ]);
-  return summary;
+  return { missing: summary.missing, over: summary.over, rows: rows };
+}
+
+/** Just the numbers, for the phone. */
+function brief_(results) {
+  return results ? { missing: results.missing, over: results.over } : null;
 }
 
 function latestCountState_() {
   const number = latestCount_();
   if (!number) return null;
   const results = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(countName_(number) + RESULTS_SUFFIX);
-  return { number: number, started: countStarted_(number), resultsGid: results ? results.getSheetId() : null };
+  const info = countInfo_(number);
+  return { number: number, started: info.started, closed: info.closed, resultsGid: results ? results.getSheetId() : null };
 }
 
 /* ---------- Domain helpers ---------- */
@@ -1129,7 +1218,8 @@ function rebuildViews_(db) {
       else if (r.action === ACTION.GIVEN_OUT) t.given += q;
     });
     if (r.action === ACTION.GIVEN_OUT && r.packet) day.packetNet[r.packet] = (day.packetNet[r.packet] || 0) + q;
-    if (r.action === ACTION.GIVEN_OUT && r.op) {
+    // A shortage written off by closing a stock count went to nobody, so it isn't a handout.
+    if (r.action === ACTION.GIVEN_OUT && r.op && String(r.note).indexOf(COUNT_PREFIX) !== 0) {
       const handout = String(r.op).replace(/:undo$/, '');
       day.handoutNet[handout] = (day.handoutNet[handout] || 0) + q;
     }

@@ -889,3 +889,69 @@ test('rows typed into a count tab count too, and unreadable ones are reported', 
   b.context.onEdit({ range: { getSheet: () => log } });
   assert.equal(resultFor(b, 1, BEANS)['Итог'], 'Не хватает');
 });
+
+test('closing a count makes stock match it, from the difference it found', () => {
+  const c = clock('2026-11-16T09:00:00Z');
+  const b = seeded(() => c.now);
+  b.call('receive', { opId: op(), barcode: MILK, qty: 3, product: { name: 'Milk' } });
+  c.at('10:00');
+  b.call('countStart', { opId: op(), after: 0 });
+  c.at('10:30');
+  b.call('countSave', {
+    opId: op(), number: 1,
+    items: [{ barcode: BEANS, qty: 8, at: c.at('10:10') }, { barcode: RICE, qty: 6, at: c.at('10:10') }, { barcode: UNKNOWN, name: 'Argeta 95 g', qty: 2, at: c.at('10:10') }],
+  });
+  // Beans handed out after their shelf was counted still count: 8 on the shelf, then 1 gone.
+  c.at('10:40');
+  b.call('handout', { opId: op(), items: [{ barcode: BEANS, qty: 1 }] });
+
+  c.at('11:00');
+  const id = op();
+  const closed = b.call('countClose', { opId: id, number: 1 });
+  assert.equal(closed.ok, true);
+  assert.deepEqual([closed.result.products, closed.result.received, closed.result.given], [3, 2, 5]);
+  assert.equal(stockOf(closed, BEANS).available, 7);
+  assert.equal(stockOf(closed, RICE).available, 6);
+  assert.equal(stockOf(closed, MILK).available, 0);
+  assert.equal(stockOf(closed, UNKNOWN).available, 2);
+  assert.equal(stockOf(closed, UNKNOWN).name, 'Argeta 95 g');
+  assert.equal(closed.state.count.closed, '2026-11-16 11:00');
+
+  const rows = b.tab('Журнал').rows().filter((r) => r['Примечание'] === 'Инвентаризация-1');
+  assert.deepEqual(rows.map((r) => [r['Действие'], r['Штрихкод'], r['Кол-во'], r['Время']]).sort(), [
+    ['Выдано', BEANS, 2, '2026-11-16 11:00'],
+    ['Выдано', MILK, 3, '2026-11-16 11:00'],
+    ['Получено', UNKNOWN, 2, '2026-11-16 11:00'],
+  ].sort());
+  // A write-off went to nobody, so the day's handouts are just the real one.
+  assert.equal(b.tab('По дням').rows()[0]['Выдач'], 1);
+  assert.equal(b.tab('Инвентаризация-1 итоги').cell(5, 9).value, 'Закрыта');
+
+  // Closed means closed: no more saves, and results stay as they were.
+  assert.equal(b.call('countSave', { opId: op(), number: 1, items: [{ barcode: BEANS, qty: 1 }] }).key, 'countClosed');
+  assert.equal(b.call('countClose', { opId: op(), number: 1 }).result.already, true);
+  assert.equal(b.call('countClose', { opId: id, number: 1 }).replayed, true);
+  assert.equal(resultFor(b, 1, BEANS)['Разница'], -2);
+
+  // Undo takes the corrections back and opens the count again.
+  const undone = b.call('undo', { opId: op(), targetOp: id });
+  assert.equal(undone.ok, true);
+  assert.equal(stockOf(undone, BEANS).available, 9);
+  assert.equal(stockOf(undone, MILK).available, 3);
+  assert.equal(undone.state.count.closed, '');
+  assert.equal(b.call('countSave', { opId: op(), number: 1, items: [{ barcode: MILK, qty: 3, at: c.at('11:05') }] }).ok, true);
+  assert.equal(resultFor(b, 1, MILK)['Итог'], 'Сходится');
+});
+
+test('only the newest count can be closed, and a count with nothing wrong closes cleanly', () => {
+  const b = seeded();
+  b.call('countStart', { opId: op(), after: 0 });
+  b.call('countStart', { opId: op(), after: 1 });
+  assert.equal(b.call('countClose', { opId: op(), number: 1 }).key, 'countNotLatest');
+  b.call('countSave', { opId: op(), number: 2, items: [{ barcode: BEANS, qty: 10 }, { barcode: RICE, qty: 6 }] });
+  const id = op();
+  const closed = b.call('countClose', { opId: id, number: 2 });
+  assert.equal(closed.result.products, 0);
+  assert.equal(b.tab('Журнал').rows().length, 2);
+  assert.equal(b.call('undo', { opId: op(), targetOp: id }).state.count.closed, '');
+});
